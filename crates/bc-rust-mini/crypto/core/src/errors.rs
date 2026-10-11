@@ -1,0 +1,261 @@
+//! Core error types to be used in Result return types.
+//! Errors defined in this module are typically one-to-one with traits defined in [`crate::traits`].
+//!
+//! Most errors are self-explanatory, but additional description is available on some.
+//!
+//! All error enums exported from this crate are tagged `#[non_exhaustive]` to indicate that they
+//! are highly likely to gain more branches in the future; therefore, the compiler is to treat it as
+//! an error if a caller matches exhaustively against the current set of variants.
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum HashError {
+    ///
+    GenericError(&'static str),
+    ///
+    InvalidLength(&'static str),
+    ///
+    InvalidState(&'static str),
+    ///
+    InvalidInput(&'static str),
+    ///
+    KeyMaterialError(KeyMaterialError),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum KeyMaterialError {
+    ///
+    ActingOnZeroizedKey,
+    ///
+    GenericError(&'static str),
+    ///
+    HazardousOperationNotPermitted,
+    ///
+    InputDataLongerThanKeyCapacity,
+    ///
+    InvalidKeyType(&'static str),
+    ///
+    InvalidLength,
+    ///
+    SecurityStrength(&'static str),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum KDFError {
+    ///
+    GenericError(&'static str),
+    ///
+    HashError(HashError),
+    ///
+    InvalidLength(&'static str),
+    ///
+    KeyMaterialError(KeyMaterialError),
+    ///
+    MACError(MACError),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum KEMError {
+    ///
+    GenericError(&'static str),
+    ///
+    ConsistencyCheckFailed(&'static str),
+    ///
+    EncodingError(&'static str),
+    ///
+    DecapsulationFailed,
+    ///
+    DecodingError(&'static str),
+    ///
+    KeyGenError(&'static str),
+    ///
+    KeyMaterialError(KeyMaterialError),
+    ///
+    LengthError(&'static str),
+    ///
+    RNGError(RNGError),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MACError {
+    ///
+    GenericError(&'static str),
+    ///
+    HashError(HashError),
+    ///
+    InvalidLength(&'static str),
+    ///
+    InvalidState(&'static str),
+    ///
+    KeyMaterialError(KeyMaterialError),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RNGError {
+    ///
+    GenericError(&'static str),
+
+    /// Attempting to extract output before the RNG has been seeded.
+    Uninitialized,
+
+    /// The RNG has been seeded, but not sufficiently to support the requested generation operation.
+    /// This includes uses in SP 800-90A mode where more output is requested than the security strength
+    /// to which the RNG has been initialized.
+    InsufficientSeedEntropy,
+
+    /// Indicates that the RNG cannot produce any more output until it has been reseeded with fresh entropy.
+    ReseedRequired,
+
+    /// Thrown my algorithms attempting to use an RNG instance, for example for key generation or
+    /// other randomness required by the algorithm, but the provided RNG is at a lower security strength
+    /// than the algorithm requires.
+    SecurityStrengthInsufficientForAlgorithm,
+
+    ///
+    KeyMaterialError(KeyMaterialError),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SuspendableError {
+    /// The serialized state was produced by a library version incompatible with this one.
+    IncompatibleVersion,
+    /// The serialized state is malformed or corrupt.
+    InvalidData,
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SignatureError {
+    ///
+    GenericError(&'static str),
+    ///
+    ConsistencyCheckFailed(),
+    ///
+    EncodingError(&'static str),
+    ///
+    DecodingError(&'static str),
+    ///
+    KeyGenError(&'static str),
+    ///
+    KeyMaterialError(KeyMaterialError),
+    ///
+    LengthError(&'static str),
+    ///
+    SignatureVerificationFailed,
+    ///
+    RNGError(RNGError),
+}
+
+///
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SymmetricCipherError {
+    ///
+    GenericError(&'static str),
+    ///
+    AEADTagCheckFailed,
+    ///
+    DecryptionFailed,
+    /// Indicates that the output buffer is not large enough to hold the requested output.
+    /// The usize represents the required buffer length.
+    IncorrectOutputBufferLength(&'static str, usize),
+    ///
+    KeyMaterialError(KeyMaterialError),
+    ///
+    RNGError(RNGError),
+    ///
+    StateError(&'static str),
+}
+
+/*** Promotion functions ***/
+impl From<KeyMaterialError> for SymmetricCipherError {
+    fn from(e: KeyMaterialError) -> SymmetricCipherError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<RNGError> for SymmetricCipherError {
+    fn from(e: RNGError) -> SymmetricCipherError {
+        Self::RNGError(e)
+    }
+}
+
+impl From<KeyMaterialError> for HashError {
+    fn from(e: KeyMaterialError) -> HashError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<HashError> for KDFError {
+    fn from(e: HashError) -> KDFError {
+        Self::HashError(e)
+    }
+}
+
+impl From<MACError> for KDFError {
+    fn from(e: MACError) -> KDFError {
+        Self::MACError(e)
+    }
+}
+
+impl From<KeyMaterialError> for KDFError {
+    fn from(e: KeyMaterialError) -> KDFError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<KeyMaterialError> for KEMError {
+    fn from(e: KeyMaterialError) -> KEMError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<RNGError> for KEMError {
+    fn from(e: RNGError) -> KEMError {
+        Self::RNGError(e)
+    }
+}
+
+impl From<KeyMaterialError> for MACError {
+    fn from(e: KeyMaterialError) -> MACError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<HashError> for MACError {
+    fn from(e: HashError) -> MACError {
+        Self::HashError(e)
+    }
+}
+
+impl From<KeyMaterialError> for RNGError {
+    fn from(e: KeyMaterialError) -> RNGError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<KeyMaterialError> for SignatureError {
+    fn from(e: KeyMaterialError) -> SignatureError {
+        Self::KeyMaterialError(e)
+    }
+}
+
+impl From<RNGError> for SignatureError {
+    fn from(e: RNGError) -> SignatureError {
+        Self::RNGError(e)
+    }
+}

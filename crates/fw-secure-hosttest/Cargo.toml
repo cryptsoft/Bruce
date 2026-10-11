@@ -1,0 +1,70 @@
+# Host tests for the Secure world's storage logic.
+#
+# `pqf-fw-secure` is a bin crate for thumbv8m with `cmse_nonsecure_entry`
+# veneers; it cannot be compiled for the host, so `cargo test` can never
+# reach it directly. This crate pulls the storage modules in by path and
+# supplies the two things they touch that the host does not have: a
+# `flash_op` that just runs its closure, and a `rom_data` that reads and
+# writes a simulated flash array with real NOR semantics.
+#
+# 5328 lines of Secure world had no tests at all. The credential store,
+# the monotonic counter and the PIN retry logic had only ever been
+# checked by hand on silicon -- a 240-write churn run and a few reboots.
+# This is where the awkward cases live instead.
+#
+#   cargo test -p pqf-fw-secure-hosttest --target "$(rustc -vV | awk '/^host:/{print $2}')"
+
+[package]
+name = "pqf-fw-secure-hosttest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "pqf_fw_secure_hosttest"
+path = "src/lib.rs"
+
+# The Secure modules say `use rp235x_hal as hal;` and reach for
+# `hal::rom_data`. Renamed here so that resolves to the simulator.
+# `ctap.rs` selects its COSE algorithm id on the same feature the Secure
+# image uses, so the harness has to declare it too. One level: the
+# response *shapes* are level-independent, and the sizes that are not are
+# already covered by `pqf-signer-core`'s own per-level tests.
+[features]
+# `dev-escape` gates the injected gesture and `raw_pressed`, both of
+# which exist to make the presence gate testable. On, because that is
+# what this crate is for -- and it is precisely the build a shipping
+# image must NOT be.
+default = ["mldsa65", "dev-escape"]
+dev-escape = []
+mldsa44 = ["pqf-signer-core/mldsa44"]
+mldsa65 = ["pqf-signer-core/mldsa65"]
+mldsa87 = ["pqf-signer-core/mldsa87"]
+
+[dependencies]
+rp235x_hal = { package = "pqf-fw-secure-halsim", path = "halsim" }
+cortex_m = { package = "pqf-cortexm-sim", path = "cortexmsim" }
+# `ctap.rs` sizes its buffers from the ML-DSA constants. One variant, as
+# the firmware does; the response-shape logic is level-independent.
+pqf-signer-core = { path = "../signer-core", default-features = false }
+# Same versions the Secure image pins, so the code under test is linked
+# against what it ships against.
+sha2 = { version = "0.10", default-features = false }
+aes = { version = "0.8", default-features = false }
+hmac = { version = "0.12", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "sha256"] }
+subtle = { version = "2", default-features = false }
+
+[dev-dependencies]
+# The clientpin tests play the client's half for real: P-256 key
+# agreement against the token's point, AES-256-CBC, HMAC-SHA-256. Faking
+# any of those would prove only that the token agrees with itself.
+p256 = { version = "0.13", features = ["ecdh"] }
+aes = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+# The tests inspect the simulated die directly (erase and program
+# counts), so they need it under its real name too.
+rp235x_hal = { package = "pqf-fw-secure-halsim", path = "halsim" }
+cortex_m = { package = "pqf-cortexm-sim", path = "cortexmsim" }

@@ -1,0 +1,13 @@
+# Stands in for `rp235x_hal` when the Secure storage modules are compiled
+# for the host. Only `rom_data` is needed: the storage code touches the
+# HAL for nothing else.
+[package]
+name = "pqf-fw-secure-halsim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "rp235x_hal"
+path = "src/lib.rs"

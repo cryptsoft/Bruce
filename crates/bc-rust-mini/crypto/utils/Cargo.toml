@@ -1,0 +1,9 @@
+[package]
+name = "bouncycastle-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+bouncycastle-core.workspace = true

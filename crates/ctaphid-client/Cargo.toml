@@ -1,0 +1,65 @@
+# pqf-ctaphid -- host-side library for talking to CTAP 2.1
+# authenticators (e.g. the `bruce` firmware in this repo) over
+# USB HID.
+#
+# Scope: full CTAP 2.1 surface, implemented against the published
+# FIDO Alliance + W3C specs. Sister crate to `crates/cbor` -- the
+# CBOR codec used here is `pqf-cbor` from the same workspace.
+#
+# Builds for the **host** (macOS / Linux / Windows), not the
+# embedded `thumbv8m.main-none-eabihf` target the firmware uses.
+# When you `cargo build` from the workspace root for the embedded
+# target, this crate is skipped (its `lib` doesn't pull in any
+# embedded code); when you build just this crate with `cargo build
+# -p pqf-ctaphid` it picks up the host toolchain's default target.
+
+[package]
+name = "pqf-ctaphid"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side CTAP 2.1 client library. USB HID transport, CBOR via the in-tree pqf-cbor codec, clean-room implementation against the FIDO Alliance specs."
+# Licensed under the Apache License, Version 2.0. See LICENSE and
+# THIRD_PARTY.md at the repository root.
+license = "Apache-2.0"
+
+[lib]
+name = "pqf_ctaphid"
+path = "src/lib.rs"
+
+[dependencies]
+# Cross-platform USB HID transport. Wraps the C `hidapi` library and
+# papers over the per-OS differences (macOS IOKit, Linux hidraw,
+# Windows WinUSB). Treated as the transport layer only -- the CTAP
+# protocol layer above it is in-tree.
+hidapi = { version = "2", default-features = false, features = ["linux-static-hidraw", "macos-shared-device"] }
+
+# CBOR codec -- workspace path dep into the firmware's in-tree
+# crate. Provides `Value`, `encode`, `decode` plus the construction
+# macros (`cbor_int!`, `cbor_map!`, etc.).
+pqf-cbor = { path = "../cbor" }
+
+# Crypto primitives for the CTAP 2.1 PIN protocol (CTAP 2.1 sec. 6.5.6).
+# These are primitive providers, not CTAP implementations -- same
+# status as `hidapi` for the transport. Pinned against the
+# RustCrypto family the firmware already vendors, so we use the
+# same well-vetted code on both sides of the wire.
+#
+#   p256       -- ECDH(P-256) for the shared-secret derivation that
+#                wraps PIN-protocol payloads, and the ECDSA check of
+#                a credential's signature (`pkcs8` turns on the strict
+#                DER parser, `Signature::from_der`; its crates are
+#                already in Cargo.lock).
+#   sha2       -- SHA-256 (PIN hash, COSE_Key fingerprint).
+#   hmac       -- HMAC-SHA-256 for the pinUvAuthParam computation.
+#   aes + cbc  -- AES-256-CBC for new-PIN-enc / pinHashEnc.
+#   hkdf       -- RFC 5869 expand step used by PIN protocol v2 to
+#                derive separate AES + HMAC keys from the ECDH point.
+#   rand       -- OS entropy source for the host's ephemeral ECDH
+#                key pair and the v2 random IV.
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["std", "block-padding"] }
+hkdf = { version = "0.12", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }

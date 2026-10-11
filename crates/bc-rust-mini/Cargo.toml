@@ -1,0 +1,51 @@
+# bc-rust-mini -- nested workspace root for the vendored Bouncy Castle
+# Rust crates under crypto/. See README.md for what is vendored and why,
+# and UPSTREAM for the branch and commit the snapshot was taken from.
+#
+# The vendored manifests inherit `edition` and their sibling
+# dependencies from a workspace root (`edition.workspace = true`,
+# `bouncycastle-core.workspace = true`), exactly as they do upstream.
+# This file is the trimmed counterpart of upstream's root Cargo.toml:
+# the same [workspace.package] and the same [workspace.dependencies]
+# entries, limited to the crates that are actually here. It carries no
+# [package] of its own (upstream's root is also the `bouncycastle`
+# facade crate, which is not vendored).
+#
+# The outer pqc-fido workspace lists this directory under `exclude`, so
+# the firmware consumes these crates purely as path dependencies: their
+# dev-dependencies (criterion, serde_json, the test framework) never
+# enter the firmware's Cargo.lock. Building or testing the vendored
+# crates themselves is done from this directory:
+#
+#   cd crates/bc-rust-mini && cargo test --target <host triple>
+#   (the root .cargo/config.toml defaults builds under it to the
+#   embedded target, so name the host explicitly)
+#
+# Keep this file in step with upstream's root when refreshing with
+# tools/vendor-bc-rust.sh: the vendored manifests take their version
+# from [workspace.package] below (`version.workspace = true`), so the
+# number here is the bc-rust release the snapshot is based on.
+
+[workspace]
+resolver = "2"
+members = ["crypto/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.3"
+
+[workspace.dependencies]
+bouncycastle-core = { path = "crypto/core" }
+bouncycastle-core-test-framework = { path = "crypto/core-test-framework" }
+bouncycastle-hex = { path = "crypto/hex" }
+bouncycastle-hkdf = { path = "crypto/hkdf" }
+bouncycastle-hmac = { path = "crypto/hmac" }
+bouncycastle-mldsa-lowmemory = { path = "crypto/mldsa-lowmemory" }
+bouncycastle-rng = { path = "crypto/rng" }
+bouncycastle-sha2 = { path = "crypto/sha2" }
+bouncycastle-sha3 = { path = "crypto/sha3" }
+bouncycastle-utils = { path = "crypto/utils" }
+
+# Benchmarks only (dev-dependency of the vendored crates); never part
+# of a firmware build.
+criterion = "0.8.2"

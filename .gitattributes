@@ -1,0 +1,6 @@
+# Binary fixtures and artifacts: never diffed as text, never ASCII-checked.
+*.bin binary
+*.dfu binary
+*.uf2 binary
+*.elf binary
+*.pdf binary

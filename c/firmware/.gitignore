@@ -1,0 +1,12 @@
+# CMake build tree -- entirely reproducible from CMakeLists.txt.
+build/
+build-*/
+
+# UF2 artefacts get rebuilt on every change; mirror the policy in
+# c/.gitignore for the cbor / hid sub-libraries.
+*.uf2
+*.elf
+*.bin
+*.hex
+*.map
+*.dis

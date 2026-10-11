@@ -1,0 +1,44 @@
+# Milestone 1 of the TrustZone-M split (see docs/TRUSTZONE.md).
+#
+# The NON-SECURE image. Launched by the Secure image (fw-secure), runs
+# with no access to keys, TRNG, or flash -- its M1 job is to blink the
+# LED by calling the Secure gateway veneer `sg_led_set`, proving the
+# boundary works. Links against libnsclib.a (the veneer import library
+# fw-secure's build emits). Standalone, like fw-secure.
+#
+# Licensed under the Apache License, Version 2.0.
+[package]
+name = "fw-nonsecure"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "fw-nonsecure"
+path = "src/main.rs"
+
+[features]
+# Mirrors fw-secure/dev-escape: enables the CTAPHID reboot command that
+# calls the Secure escape veneer. Enable BOTH or neither -- NS alone
+# cannot reboot, and the Secure symbol will not exist to link against.
+dev-escape = []
+# Test-only: enumerate but never call sg_healthy, so the Secure
+# dead-man's switch should reclaim the board on its own. Deliberately
+# still enumerates -- that keeps the CMD_REBOOT escape available as a
+# fallback if the switch itself is broken, so validating recovery can
+# never strand the board.
+test-no-checkin = ["dev-escape"]
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+# M2b: NS runs the USB device stack. rp235x-hal for the UsbBus driver
+# (default features off -- we only need usb + the pac, not board glue),
+# usb-device for enumeration.
+rp235x-hal = { version = "0.4", default-features = false, features = ["critical-section-impl"] }
+usb-device = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,51 @@
+# pqf-signer-core -- the hybrid (ECDSA-P256 + ML-DSA) core-1 signing
+# worker and its cross-core mailbox protocol, extracted from the
+# firmware so it can be compiled for EITHER of the RP2350's
+# instruction sets independently of the main image:
+#
+#   * the firmware links it for whatever architecture the firmware
+#     itself targets (Arm Cortex-M33 or Hazard3 RISC-V -- core 1 runs
+#     the same instruction set as core 0 in those builds), and
+#   * the `pqf-core1-riscv` blob crate links it for riscv32imac to
+#     produce the standalone RISC-V core-1 payload used by the
+#     mixed-architecture build (`core1_riscv` firmware feature: Arm
+#     core 0 + RISC-V core 1 on the same silicon).
+#
+# No HAL / PAC / runtime dependencies -- just the crypto stack, the
+# `repr(C)` shared-SRAM mailbox, and the small `arch` asm shim. That
+# is what makes the dual-compilation trick cheap.
+#
+# Licensed under the Apache License, Version 2.0. See LICENSE and
+# THIRD_PARTY.md at the repository root. Contains the OpenSK-derived HYBRID_LABEL
+# constant (Apache-2.0 attribution in LICENSE-APACHE-OPENSK).
+
+[package]
+name = "pqf-signer-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Same mutually-exclusive ML-DSA level selection as the firmware --
+# the firmware and blob crates forward their choice here so all three
+# always agree on `MLDSA_SIG_LEN` (it sizes the mailbox signature
+# buffer, which is shared SRAM ABI in the mixed-architecture build).
+[features]
+mldsa44 = []
+mldsa65 = []
+mldsa87 = []
+
+[dependencies]
+# ML-DSA -- Bouncy Castle Rust port, low-memory variant. Same pinned
+# path deps as the firmware (see crates/firmware/Cargo.toml for the
+# rationale and the streaming-hook surface we use).
+bouncycastle-mldsa-lowmemory = { path = "../bc-rust-mini/crypto/mldsa-lowmemory", default-features = false }
+bouncycastle-core-interface = { package = "bouncycastle-core", path = "../bc-rust-mini/crypto/core", default-features = false }
+
+# SHA-256 for the hybrid prehash and the ML-DSA hedging nonce, from the
+# same Bouncy Castle port that supplies ML-DSA. `sha2` (RustCrypto) is
+# still in the graph because `p256` needs it internally for RFC 6979.
+bouncycastle-sha2 = { path = "../bc-rust-mini/crypto/sha2", default-features = false }
+
+# ECDSA-P256 half of the hybrid signature.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+zeroize = { version = "1.7", default-features = false }

@@ -1,0 +1,58 @@
+# Rust / Cargo build artifacts (workspace root + any stray per-crate dirs).
+/target
+**/target/
+
+# UF2 images produced by build.sh / picotool.
+*.uf2
+
+# C firmware build directories (CMake out-of-tree builds + host test harness).
+# ./build-c.sh configures into c/firmware/build-<board>[-riscv]/.
+c/firmware/build/
+c/firmware/build-*/
+c/firmware/test/build/
+c/bootloader/test/build/
+
+# Python bytecode from tools/*.py.
+__pycache__/
+
+# Output directory of tools/dfu-powerloss-test.sh (journals, staged images).
+build-powerloss/
+
+# Cargo.lock IS tracked for this binary workspace -- reproducible builds and
+# the THIRD_PARTY.md audit trail both depend on the resolved versions. The
+# explicit un-ignore guards against a global gitignore that ignores it.
+!/Cargo.lock
+
+# The vendored bc-rust crates form a nested workspace (crates/bc-rust-mini);
+# the firmware consumes them by path and resolves them in the root
+# Cargo.lock above. The lockfile cargo writes there when the vendored
+# suites are run covers only their dev-dependencies and is not tracked.
+crates/bc-rust-mini/Cargo.lock
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# c/gadget out-of-tree build dirs
+c/gadget/build*/
+tools/tz/tz_transport
+build-secureboot/
+c/bootloader/build*/
+
+# Private keys. Everything matching is ignored, and the two published dev
+# keys are then un-ignored by name -- so `git add keys/` picks up nothing
+# new, and a production key generated into this tree cannot be committed
+# by a careless `git add -A`.
+#
+# This is a backstop, not the control. A production key should never be on
+# a machine that has this repository checked out at all; see 'Production
+# key ceremony' in docs/SECUREBOOT.md. Ignoring a file does not protect it,
+# it only stops one specific accident.
+*.pem
+*.p8
+*.pkcs8
+*.key
+keys/*
+!keys/pqf-dev-fw.pem
+!keys/pqf-dev-bootkey.pem
+!keys/README.md

@@ -1,0 +1,253 @@
+name: CI
+
+# What a green run proves: both firmware ports build for every board
+# profile they claim, every test that needs no token passes, the
+# signing-tool guards still recognise the published development keys,
+# the tree is ASCII, and the Rust dependency tree is still permissively
+# licensed, free of known advisories and sourced from crates.io alone.
+# It mirrors the local checks in docs/TESTING.md ("Host tests: one
+# command") and the build matrix in docs/BUILD.md.
+#
+# What it cannot prove: anything that needs silicon. User presence, the
+# reboot into BOOTSEL, the USB-C token procedure and the timing numbers
+# are recorded by hand in docs/TESTING.md after each run on a board.
+#
+# The Bouncy Castle Rust crates the firmware links are vendored under
+# crates/bc-rust-mini/ (see its README.md), so a plain checkout of this
+# repository is everything the Rust jobs need. The C jobs clone the
+# Raspberry Pi pico-sdk at the version the tree is developed against.
+#
+# Every third-party action is pinned to a commit, with the release it
+# corresponds to in the comment; bump the commit and the comment together.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The workflow only reads the repository; nothing here needs to write
+# to it, open issues or publish packages.
+permissions:
+  contents: read
+
+# One run per branch at a time; a newer push cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The toolchain is pinned by rust-toolchain.toml (nightly-2025-06-23 +
+# the thumbv8m.main-none-eabihf and riscv32imac-unknown-none-elf targets
+# + rustfmt/clippy/llvm-tools). rustup honours that file automatically
+# inside the checkout, so no explicit channel is named here.
+env:
+  CARGO_TERM_COLOR: always
+  PICO_SDK_VERSION: 2.3.1
+
+jobs:
+  # ---- Rust firmware: ML-DSA level x board profile, all six boards ----
+  firmware-build:
+    name: Rust firmware (${{ matrix.mldsa }} / ${{ matrix.board }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mldsa: [mldsa44, mldsa65, mldsa87]
+        board:
+          - board_tiny2350
+          - board_xiao_rp2350
+          - board_feitian_rp2350
+          - board_feitian_rp2350_usbc
+          - board_waveshare_rp2350_lcd_1_47
+          - board_spotpear_rp2350_lcd_1_28
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # rust-toolchain.toml pins the nightly + the embedded targets; the
+      # first cargo invocation auto-installs it.
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: firmware-${{ matrix.mldsa }}-${{ matrix.board }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build firmware (${{ matrix.mldsa }}, ${{ matrix.board }})
+        run: |
+          cargo build --release -p bruce \
+            --target thumbv8m.main-none-eabihf \
+            --no-default-features \
+            --features "${{ matrix.mldsa }},${{ matrix.board }}"
+
+  # ---- Every Rust host suite, the bare-metal build checks, the key
+  #      guards and the ASCII check: tools/host-tests.sh rust ----
+  host-tests-rust:
+    name: Rust host suites + guards (tools/host-tests.sh rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      # hidapi (a pqf-ctaphid dependency) needs the system libudev
+      # headers to build on Linux. tools/test-key-guards.sh drives
+      # tools/pqf_sign.py, which needs the Python cryptography package,
+      # and the openssl command line, which Ubuntu ships.
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config build-essential \
+            python3 python3-cryptography openssl
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: host-tests-rust-${{ hashFiles('Cargo.lock') }}
+
+      # The tree is rustfmt-clean under the pinned nightly's rustfmt; a
+      # change that is not fails here, before anything is built. The two
+      # TrustZone crates are outside the workspace, so they are checked
+      # on their own.
+      - name: cargo fmt --check
+        run: |
+          cargo fmt --all -- --check
+          (cd crates/fw-secure && cargo fmt -- --check)
+          (cd crates/fw-nonsecure && cargo fmt -- --check)
+
+      # Every Rust crate's host tests (with their feature variants and
+      # the simulated flash dies), the bare-metal build checks for both
+      # instruction sets and every board profile, then the dev-key
+      # guards and the ASCII sweep over the whole tree. The script
+      # fails on the first suite that reports anything but ok.
+      - name: tools/host-tests.sh rust
+        run: ./tools/host-tests.sh rust
+
+  # ---- The C port's host suites: tools/host-tests.sh c ----
+  host-tests-c:
+    name: C host suites + guards (tools/host-tests.sh c)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The C suites compile the protocol modules + vendored openssl-mini
+      # on the host with cc. The key guards need python3-cryptography.
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 python3-cryptography openssl
+
+      # The USB descriptor tests compile against the real TinyUSB macros
+      # and the gadget's network tests against the real lwIP sources, so
+      # both need a pico-sdk checkout with those two submodules (headers
+      # and sources only; nothing is built for a board). Same SDK
+      # version the tree is developed against.
+      - name: Checkout pico-sdk (TinyUSB + lwIP)
+        run: |
+          git clone -q --depth 1 --branch "$PICO_SDK_VERSION" \
+            https://github.com/raspberrypi/pico-sdk.git "$HOME/pico-sdk"
+          git -C "$HOME/pico-sdk" submodule update --init --depth 1 lib/tinyusb lib/lwip
+          echo "PICO_SDK_PATH=$HOME/pico-sdk" >> "$GITHUB_ENV"
+
+      # The gadget network test, the C firmware host suite (every
+      # test_* binary, the descriptor, core-1 and reboot-policy
+      # programs), then the key guards and the ASCII sweep.
+      - name: tools/host-tests.sh c
+        run: ./tools/host-tests.sh c
+
+      # The bootloader carries its own host suite (signed-image
+      # verification: hash, signature, board id and format rejection)
+      # and a round trip from the Python signer into the C verifier.
+      - name: Bootloader host tests + signer round trip
+        working-directory: c/bootloader/test
+        run: |
+          make test
+          make interop
+
+  # ---- C firmware: every board profile, Arm, ML-DSA-65 ----
+  c-firmware-build:
+    name: C firmware (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - tiny2350
+          - xiao_rp2350
+          - feitian_rp2350
+          - feitian_rp2350_usbc
+          - waveshare_rp2350_lcd_1_47
+          - spotpear_rp2350_lcd_1_28
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Ubuntu's Arm GCC with newlib, cmake, and libusb for the picotool
+      # the SDK builds for itself below.
+      - name: Install the Arm toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib libusb-1.0-0-dev
+
+      - name: Checkout pico-sdk (with TinyUSB)
+        run: |
+          git clone -q --depth 1 --branch "$PICO_SDK_VERSION" \
+            https://github.com/raspberrypi/pico-sdk.git "$HOME/pico-sdk"
+          git -C "$HOME/pico-sdk" submodule update --init --depth 1 lib/tinyusb
+          echo "PICO_SDK_PATH=$HOME/pico-sdk" >> "$GITHUB_ENV"
+
+      # Same configure as ./build-c.sh, called directly: the wrapper
+      # insists on a picotool on PATH of the SDK's own major.minor, and
+      # on a runner it is simpler to let the SDK build that picotool
+      # itself (PICOTOOL_FORCE_FETCH_FROM_GIT) than to package one.
+      - name: Configure + build (${{ matrix.board }}, ML-DSA-65)
+        run: |
+          cmake -S c/firmware -B "c/firmware/build-${{ matrix.board }}" \
+            -DPQF_BOARD=${{ matrix.board }} -DPQF_HYBRID_VARIANT=65 \
+            -DPQF_REBOOT_NO_UP=OFF -DPQF_SINGLE_CORE=OFF \
+            -DPQF_RESIDENT_EXTRA_SECTORS=0 \
+            -DPICOTOOL_FORCE_FETCH_FROM_GIT=1
+          cmake --build "c/firmware/build-${{ matrix.board }}" -j
+          ls -l "c/firmware/build-${{ matrix.board }}/bruce_c.uf2"
+
+  # ---- Dependencies: licences, advisories, bans and sources ----
+  cargo-deny:
+    name: Dependency audit (cargo deny check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny
+
+      # deny.toml holds the licence allow-list that THIRD_PARTY.md's audit
+      # rests on, the advisories the project has looked at and accepted,
+      # and the rule that every crate comes from crates.io or this tree.
+      # All four checks run; any new crate under another licence, any new
+      # RustSec advisory, or any git dependency fails this step.
+      - name: cargo deny check
+        run: cargo deny check

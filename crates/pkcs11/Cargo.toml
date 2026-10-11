@@ -1,0 +1,38 @@
+# pqf-pkcs11 -- PKCS#11 module exposing the Bruce token as an RNG.
+#
+# The Rust sibling of the C module in `c/pkcs11/`. Same behaviour, same
+# wire command (vendor CTAPHID_CMD_RNG); this one is built on the
+# in-tree `pqf-ctaphid` transport and the `cryptoki-sys` ABI crate
+# rather than the vendored OASIS headers + libpqhid.
+#
+# Builds a cdylib for the **host** (macOS / Linux / Windows), not the
+# embedded firmware target. Excluded from the workspace default set for
+# the same reason as `pqf-ctaphid`; build it with the host triple:
+#
+#   cargo build -p pqf-pkcs11 --release \
+#       --target $(rustc -vV | awk '/host/{print $2}')
+#
+# The output is `libpqf_pkcs11.dylib` / `.so` -- point pkcs11-tool /
+# the OpenSSL pkcs11 provider at it exactly like the C module.
+
+[package]
+name = "pqf-pkcs11"
+version = "0.1.0"
+edition = "2021"
+description = "PKCS#11 module exposing the Bruce token as an RNG (C_GenerateRandom over the vendor CTAPHID_CMD_RNG command). Rust sibling of c/pkcs11."
+license = "Apache-2.0"
+
+[lib]
+name = "pqf_pkcs11"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# PKCS#11 ABI: the Cryptoki types, constants and the CK_FUNCTION_LIST
+# layout, as prebuilt bindgen output (no bindgen at build time). This
+# is the Rust equivalent of the vendored OASIS headers the C module
+# uses -- same authority (the OASIS pkcs11 headers), package-managed.
+cryptoki-sys = "0.5"
+
+# Host-side CTAP-over-USB-HID transport + the Cmd::Rng vendor command.
+pqf-ctaphid = { path = "../ctaphid-client" }

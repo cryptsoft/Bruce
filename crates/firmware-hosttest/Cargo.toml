@@ -1,0 +1,75 @@
+# Host tests for the Rust firmware's hardware-free logic.
+#
+# `bruce` is a bin crate for thumbv8m with its own linker script and a
+# global allocator, so `cargo test` can never reach it directly. The
+# modules that matter most do not touch the machine at all -- no HAL, no
+# `rom_data`, no fixed XIP address -- so the real source is pulled in by
+# `#[path]` and the one thing that does need hardware, the TRNG, is
+# stubbed.
+#
+# The C port has had twelve host binaries over the same CTAP2 ground
+# since Phase C-11. This is the Rust half of that, and it starts with the
+# sealed credential id: `test_domain.c` already proves every single-byte
+# flip of the sealed blob is rejected, and the Rust port made no such
+# claim.
+#
+#   cargo test -p pqf-firmware-hosttest --target "$(rustc -vV | awk '/^host:/{print $2}')"
+
+[package]
+name = "pqf-firmware-hosttest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "pqf_firmware_hosttest"
+path = "src/lib.rs"
+
+# The same versions the firmware pins, so the code under test links
+# against what it ships against.
+# One ML-DSA level, as the firmware picks one. The credential-id format
+# is level-independent -- the seed is 32 bytes at every level -- but the
+# COSE id it carries is not, so the choice has to be declared.
+[features]
+default = ["mldsa65"]
+mldsa44 = ["pqf-signer-core/mldsa44"]
+mldsa65 = ["pqf-signer-core/mldsa65"]
+mldsa87 = ["pqf-signer-core/mldsa87"]
+# Optional CTAP1/U2F back-compat surface, matching the firmware crate.
+u2f = []
+# Optional Ed25519 (-8) algorithm, matching the firmware crate.
+ed25519 = ["dep:ed25519-dalek"]
+# Declared so ctap2.rs's `cfg(feature = "single_core")` is a known name
+# here; never enabled on the host, where the signer is a stub anyway.
+single_core = []
+
+[dependencies]
+pqf-signer-core = { path = "../signer-core", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "sha256"] }
+pqf-cbor = { path = "../cbor" }
+# The simulated NOR die, under the name the firmware reaches for. Shared
+# with the Secure world's harness: same flash, same semantics -- a
+# program may only clear bits.
+rp235x_hal = { package = "pqf-fw-secure-halsim", path = "../fw-secure-hosttest/halsim" }
+rand_core = { version = "0.6", default-features = false }
+
+# For the USB classes: dfu_runtime and fido_hid are pulled in by #[path]
+# and exercised through a mock bus. Same version the firmware resolves
+# (Cargo.lock pins 0.3.2), so this adds nothing to the tree.
+usb-device = "0.3"
+
+# For the GDB stub TX-queue suite: PKT_MAX and the Transport trait.
+pqf-gdbstub-core = { path = "../gdbstub-core" }
+
+# gdbstub.rs's Session wraps a usbd_serial::SerialPort, so pulling the
+# real file in by #[path] needs this. 0.2.2 is already resolved for the
+# firmware, so it costs one Cargo.lock line and no new download.
+usbd-serial = { version = "0.2", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, optional = true, features = ["zeroize", "rand_core", "alloc"] }
+bouncycastle-mldsa-lowmemory = { path = "../bc-rust-mini/crypto/mldsa-lowmemory", default-features = false }
+aes = { version = "0.8", default-features = false }
+zeroize = { version = "1", default-features = false }
+bouncycastle-core-interface = { package = "bouncycastle-core", path = "../bc-rust-mini/crypto/core", default-features = false }
+bouncycastle-sha2 = { path = "../bc-rust-mini/crypto/sha2", default-features = false }
+bouncycastle-utils = { path = "../bc-rust-mini/crypto/utils", default-features = false }

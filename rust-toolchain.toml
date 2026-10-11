@@ -1,0 +1,7 @@
+# Nightly required by bouncycastle-mldsa (it uses
+# `inherent_associated_types`, which is still unstable). Pinned so
+# CI / collaborators get exactly the toolchain we tested with.
+[toolchain]
+channel = "nightly-2025-06-23"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["thumbv8m.main-none-eabihf", "riscv32imac-unknown-none-elf"]

@@ -1,0 +1,32 @@
+# Copyright 2026 Cryptsoft Pty Ltd
+# SPDX-License-Identifier: Apache-2.0
+# udev rules for Bruce tokens and the RP2350 bootloader, Linux only.
+#
+# Without these, the token's HID interface is root-only, so the in-tree
+# client (the pqf-ctaphid examples, c/hid tools) and browsers cannot open
+# it as an ordinary user, and picotool cannot see the board in BOOTSEL.
+#
+# Install:
+#   sudo cp tools/udev/99-bruce.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug and replug the board.
+#
+# "uaccess" grants the logged-in desktop user access (systemd-logind);
+# the plugdev fallback covers hosts without it.
+
+# Both firmware ports, Rust and C: the placeholder VID 0xCAFE (TinyUSB's
+# example vendor id; no vendor id is registered for this project) with
+# the project-local PID 0xF1D0. A vendor who ships a product under its
+# own ids changes this line to match.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="f1d0", TAG+="uaccess", MODE="0660", GROUP="plugdev"
+# Rust TrustZone Non-secure image (distinct PID so it is never mistaken for production)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="f1dc", TAG+="uaccess", MODE="0660", GROUP="plugdev"
+
+# The C firmware's debug serial (CDC) interface, so `screen` needs no sudo.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="f1d0", TAG+="uaccess", MODE="0660", GROUP="plugdev"
+
+# RP2350 in BOOTSEL (Raspberry Pi bootrom), for picotool. picotool's own
+# package installs an equivalent rule; this one is here so a source-built
+# picotool works too.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000f", TAG+="uaccess", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0003", TAG+="uaccess", MODE="0660", GROUP="plugdev"

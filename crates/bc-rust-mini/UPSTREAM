@@ -1,0 +1,5 @@
+upstream: https://github.com/bcgit/bc-rust
+branch:   pqc-fido-nostd-0.1.3alpha
+commit:   6fb96eaf3eb13a2055e71df67668e4ec355a5208
+date:     2026-09-27
+crates:   core core-test-framework hex hkdf hmac mldsa-lowmemory rng sha2 sha3 utils

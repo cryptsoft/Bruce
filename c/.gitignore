@@ -1,0 +1,11 @@
+# Build artefacts from c/cbor and c/hid (and any future c/ sub-library).
+# Source-only repo policy: .c / .h / Makefile / smoke.c are tracked; the
+# build outputs are reproducible with `make` and so are not.
+*.o
+*.a
+smoke
+reboot
+proof
+pkcs11/pqf-pkcs11.dylib
+pkcs11/pqf-pkcs11.so
+rng

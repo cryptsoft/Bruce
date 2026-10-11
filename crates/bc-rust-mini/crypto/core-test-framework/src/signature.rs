@@ -1,0 +1,359 @@
+//! Generic behaviour tests for anything that implements [`Signer`] and [`SignatureVerifier`].
+
+use crate::DUMMY_SEED;
+use bouncycastle_core::errors::SignatureError;
+use bouncycastle_core::traits::{
+    Hash, PHSignatureVerifier, PHSigner, SignaturePrivateKey, SignaturePublicKey,
+    SignatureVerifier, Signer,
+};
+
+/// Instance of the test framework.
+pub struct TestFrameworkSignature {
+    // Put any config options here
+    /// Should the test framework expect that repeated calls to sign() will produce the same signature?
+    alg_is_deterministic: bool,
+
+    /// Does the signature algorithm use the provided context parameter? (false means that it is expected to ignore it)
+    alg_accepts_ctx: bool,
+}
+
+impl TestFrameworkSignature {
+    ///
+    pub fn new(alg_is_deterministic: bool, alg_accepts_ctx: bool) -> Self {
+        Self {
+            alg_is_deterministic,
+            alg_accepts_ctx,
+        }
+    }
+
+    /// Test all the members of traits [`Signer`] and [`SignatureVerifier`] against the given input-output pair.
+    /// This gives good baseline test coverage, but is not exhaustive.
+    ///
+    /// Since key generation is not part of either signature trait, the caller supplies a
+    /// `keygen` function pointer (the inherent `keygen` associated function on the algorithm struct).
+    pub fn test_signature<
+        PK: SignaturePublicKey<PK_LEN>,
+        SK: SignaturePrivateKey<SK_LEN>,
+        SIGNER: Signer<SK, SK_LEN, SIG_LEN>,
+        VERIFIER: SignatureVerifier<PK, PK_LEN, SIG_LEN>,
+        const PK_LEN: usize,
+        const SK_LEN: usize,
+        const SIG_LEN: usize,
+    >(
+        &self,
+        keygen: fn() -> Result<(PK, SK), SignatureError>,
+        run_full_bitflipping_tests: bool,
+    ) {
+        let msg = b"The quick brown fox jumped over the lazy dog";
+
+        // Basic test
+        let (pk, sk) = keygen().unwrap();
+        let sig_val = SIGNER::sign(&sk, msg, None).unwrap();
+        VERIFIER::verify(&pk, msg, None, &sig_val).unwrap();
+
+        // Test non-determinism
+        if !self.alg_is_deterministic {
+            let sig1 = SIGNER::sign(&sk, msg, None).unwrap();
+            let sig2 = SIGNER::sign(&sk, msg, None).unwrap();
+            assert_ne!(sig1, sig2);
+        }
+
+        // uses ctx
+        // success case
+        let sig = SIGNER::sign(&sk, msg, Some(b"test with ctx")).unwrap();
+        VERIFIER::verify(&pk, msg, Some(b"test with ctx"), &sig).unwrap();
+
+        // but it had better produce something different
+        if !self.alg_accepts_ctx {
+            let sig1 = SIGNER::sign(&sk, msg, None).unwrap();
+            let sig2 = SIGNER::sign(&sk, msg, Some(&[0u8; 1])).unwrap();
+            assert_ne!(sig1, sig2);
+        }
+
+        // Test that verification fails for broken signature value
+        let (pk, sk) = keygen().unwrap();
+        let sig_val = SIGNER::sign(&sk, msg, None).unwrap();
+
+        // spot-check
+        let mut sig_val_copy = sig_val.clone();
+        sig_val_copy[8] ^= 0x0F;
+        // should throw an Err
+        match VERIFIER::verify(&pk, msg, None, &sig_val_copy) {
+            Err(SignatureError::SignatureVerificationFailed) => (),
+            _ => panic!("This should have thrown an error but it didn't."),
+        }
+
+        // test flipping every bit ... this will take some time to run
+        if run_full_bitflipping_tests {
+            for i in 0..sig_val.len() {
+                for j in 0..8 {
+                    let mut sig_val_copy = sig_val.clone();
+                    sig_val_copy[i] ^= 1 << j;
+
+                    // should throw an Err
+                    match VERIFIER::verify(&pk, msg, None, &sig_val_copy) {
+                        Err(SignatureError::SignatureVerificationFailed) => (),
+                        _ => panic!(
+                            "This should have thrown an error but it didn't when byte {i} bit {j} of the signature was flipped"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // test the sign_out interface
+        // fn sign_out(sk: &SK, msg: &[u8], ctx: &[u8], output: &mut [u8]) -> Result<usize, SignatureError>;
+
+        // Success case
+        let mut output = [0u8; SIG_LEN];
+        let bytes_written = SIGNER::sign_out(&sk, msg, None, &mut output).unwrap();
+        assert_eq!(bytes_written, SIG_LEN);
+        VERIFIER::verify(&pk, msg, None, &sig_val).unwrap();
+
+        // test with a large message
+        let sig = SIGNER::sign(&sk, DUMMY_SEED, None).unwrap();
+        VERIFIER::verify(&pk, DUMMY_SEED, None, &sig).unwrap();
+
+        // Test the streaming signing API
+        // fn sign_init(&mut self, sk: &SK) -> Result<(), SignatureError>;
+        // fn sign_update(&mut self, msg_chunk: &[u8]);
+        // fn sign_final(&mut self, msg_chunk: &[u8], ctx: &[u8]) -> Result<Vec<u8>, SignatureError>;
+        // fn sign_final_out(&mut self, msg_chunk: &[u8], ctx: &[u8], output: &mut [u8]) -> Result<(), SignatureError>;
+
+        // First, test the streaming API with one call to .sign_update
+        let mut s = SIGNER::sign_init(&sk, Some(b"streaming API")).unwrap();
+        s.sign_update(DUMMY_SEED);
+        let sig_val = s.sign_final().unwrap();
+        VERIFIER::verify(&pk, DUMMY_SEED, Some(b"streaming API"), &sig_val).unwrap();
+
+        // Then with the message broken into chunks
+        let mut s = SIGNER::sign_init(&sk, Some(b"streaming API chunked")).unwrap();
+        for msg_chunk in DUMMY_SEED.chunks(100) {
+            s.sign_update(msg_chunk);
+        }
+        let sig_val = s.sign_final().unwrap();
+        VERIFIER::verify(&pk, DUMMY_SEED, Some(b"streaming API chunked"), &sig_val).unwrap();
+
+        // Test the streaming verification API
+        // one-shot
+        let sig = SIGNER::sign(&sk, DUMMY_SEED, Some(b"streaming API")).unwrap();
+        let mut v = VERIFIER::verify_init(&pk, Some(b"streaming API")).unwrap();
+        v.verify_update(DUMMY_SEED);
+        v.verify_final(&sig).unwrap();
+
+        // chunked
+        let sig = SIGNER::sign(&sk, DUMMY_SEED, Some(b"streaming API")).unwrap();
+        let mut v = VERIFIER::verify_init(&pk, Some(b"streaming API")).unwrap();
+        for msg_chunk in DUMMY_SEED.chunks(100) {
+            v.verify_update(msg_chunk);
+        }
+        v.verify_final(&sig).unwrap();
+
+        // failure case for streaming verify
+        let sig = SIGNER::sign(&sk, DUMMY_SEED, Some(b"streaming API")).unwrap();
+        let mut v = VERIFIER::verify_init(&pk, Some(b"streaming API")).unwrap();
+        v.verify_update(b"this is the wrong message");
+        match v.verify_final(&sig) {
+            Err(SignatureError::SignatureVerificationFailed) => (),
+            _ => panic!("This should have thrown an error but it didn't."),
+        }
+
+        // test sign_out version of streaming API
+        let mut s = SIGNER::sign_init(&sk, Some(b"streaming API")).unwrap();
+        s.sign_update(DUMMY_SEED);
+        let mut sig_val = [0u8; SIG_LEN];
+        let bytes_written = s.sign_final_out(&mut sig_val).unwrap();
+        assert_eq!(bytes_written, SIG_LEN);
+        VERIFIER::verify(&pk, DUMMY_SEED, Some(b"streaming API"), &sig_val).unwrap();
+
+        // the ::verify API should accept a sig value that's too long and just ignore the extra bytes
+        let mut sig_val_too_long = vec![1u8; SIG_LEN + 2];
+        sig_val_too_long[..SIG_LEN].copy_from_slice(&sig_val);
+        VERIFIER::verify(&pk, DUMMY_SEED, Some(b"streaming API"), &sig_val).unwrap();
+    }
+
+    /// Test all the members of traits [`PHSigner`] and [`PHSignatureVerifier`] against the given input-output pair.
+    /// This gives good baseline test coverage, but is not exhaustive.
+    ///
+    /// Since key generation is not part of either signature trait, the caller supplies a
+    /// `keygen` function pointer (the inherent `keygen` associated function on the algorithm struct).
+    pub fn test_ph_signature<
+        PK: SignaturePublicKey<PK_LEN>,
+        SK: SignaturePrivateKey<SK_LEN>,
+        // todo split this into two params: SIGNER: Signer and VERIFIER: SignatureVerifier
+        PHSIGNER: PHSigner<PK, SK, PK_LEN, SK_LEN, SIG_LEN, PH_LEN>,
+        PHVERIFIER: PHSignatureVerifier<PK, PK_LEN, SIG_LEN, PH_LEN>,
+        HASH: Hash + Default,
+        const PK_LEN: usize,
+        const SK_LEN: usize,
+        const SIG_LEN: usize,
+        const PH_LEN: usize,
+    >(
+        &self,
+        keygen: fn() -> Result<(PK, SK), SignatureError>,
+        run_full_bitflipping_tests: bool,
+    ) {
+        let msg = b"The quick brown fox jumped over the lazy dog";
+
+        // Basic test
+        let (pk, sk) = keygen().unwrap();
+        let sig_val = PHSIGNER::sign(&sk, msg, None).unwrap();
+        PHVERIFIER::verify(&pk, msg, None, &sig_val).unwrap();
+
+        // Test non-determinism
+        if !self.alg_is_deterministic {
+            let sig1 = PHSIGNER::sign(&sk, msg, None).unwrap();
+            let sig2 = PHSIGNER::sign(&sk, msg, None).unwrap();
+            assert_ne!(sig1, sig2);
+        }
+
+        // uses ctx
+        // success case
+        let sig = PHSIGNER::sign(&sk, msg, Some(b"test with ctx")).unwrap();
+        PHVERIFIER::verify(&pk, msg, Some(b"test with ctx"), &sig).unwrap();
+
+        // but it had better produce something different
+        if !self.alg_accepts_ctx {
+            let sig1 = PHSIGNER::sign(&sk, msg, None).unwrap();
+            let sig2 = PHSIGNER::sign(&sk, msg, Some(&[0u8; 1])).unwrap();
+            assert_ne!(sig1, sig2);
+        }
+
+        // Test that verification fails for broken signature value
+        let (pk, sk) = keygen().unwrap();
+        let sig_val = PHSIGNER::sign(&sk, msg, None).unwrap();
+
+        // spot-check
+        let mut sig_val_copy = sig_val.clone();
+        sig_val_copy[8] ^= 0x0F;
+        // should throw an Err
+        match PHVERIFIER::verify(&pk, msg, None, &sig_val_copy) {
+            Err(SignatureError::SignatureVerificationFailed) => (),
+            _ => panic!("This should have thrown an error but it didn't."),
+        }
+
+        // test flipping every bit ... this will take some time to run
+        if run_full_bitflipping_tests {
+            for i in 0..sig_val.len() {
+                for j in 0..8 {
+                    let mut sig_val_copy = sig_val.clone();
+                    sig_val_copy[i] ^= 1 << j;
+
+                    // should throw an Err
+                    match PHVERIFIER::verify(&pk, msg, None, &sig_val_copy) {
+                        Err(SignatureError::SignatureVerificationFailed) => (),
+                        _ => panic!(
+                            "This should have thrown an error but it didn't when byte {i} bit {j} of the signature was flipped"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // test the sign_out interface
+        // fn sign_out(sk: &SK, msg: &[u8], ctx: &[u8], output: &mut [u8]) -> Result<usize, SignatureError>;
+
+        // Success case
+        let mut output = [0u8; SIG_LEN];
+        let bytes_written = PHSIGNER::sign_out(&sk, msg, None, &mut output).unwrap();
+        assert_eq!(bytes_written, SIG_LEN);
+        PHVERIFIER::verify(&pk, msg, None, &sig_val).unwrap();
+
+        // test with a large message
+        let sig = PHSIGNER::sign(&sk, DUMMY_SEED, None).unwrap();
+        PHVERIFIER::verify(&pk, DUMMY_SEED, None, &sig).unwrap();
+
+        // the ::verify API should not accept a sig value that's too
+        let mut sig_val_too_long = vec![1u8; SIG_LEN + 2];
+        sig_val_too_long[..SIG_LEN].copy_from_slice(&sig);
+        match PHVERIFIER::verify(&pk, DUMMY_SEED, None, &sig_val_too_long) {
+            Err(SignatureError::LengthError(_)) => (),
+            _ => panic!("Unexpected error"),
+        }
+
+        // sign_ph
+        let (pk, sk) = keygen().unwrap();
+        let ph: [u8; PH_LEN] = HASH::default().hash(msg)[..PH_LEN].try_into().unwrap();
+        let sig_val = PHSIGNER::sign_ph(&sk, &ph, None).unwrap();
+        PHVERIFIER::verify(&pk, msg, None, &sig_val).unwrap();
+        PHVERIFIER::verify_ph(&pk, &ph, None, &sig_val).unwrap();
+
+        // sign_ph_out
+        let (pk, sk) = keygen().unwrap();
+        let ph: [u8; PH_LEN] = HASH::default().hash(msg)[..PH_LEN].try_into().unwrap();
+        let mut sig_val = [0u8; SIG_LEN];
+        let bytes_written = PHSIGNER::sign_ph_out(&sk, &ph, None, &mut sig_val).unwrap();
+        assert_eq!(bytes_written, SIG_LEN);
+        PHVERIFIER::verify_ph(&pk, &ph, None, &sig_val).unwrap();
+        PHVERIFIER::verify(&pk, msg, None, &sig_val).unwrap();
+    }
+}
+
+/// Instance of the test framework.
+pub struct TestFrameworkSignatureKeys {}
+
+impl TestFrameworkSignatureKeys {
+    ///
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    /// Since key generation is not part of either signature trait, the caller supplies a
+    /// `keygen` function pointer (the inherent `keygen` associated function on the algorithm struct).
+    pub fn test_keys<
+        PK: SignaturePublicKey<PK_LEN>,
+        SK: SignaturePrivateKey<SK_LEN>,
+        const PK_LEN: usize,
+        const SK_LEN: usize,
+    >(
+        &self,
+        keygen: fn() -> Result<(PK, SK), SignatureError>,
+    ) {
+        self.test_boundary_conditions::<PK, SK, PK_LEN, SK_LEN>(keygen);
+    }
+
+    /// Tests the correct behaviour on buffers too large / too small.
+    fn test_boundary_conditions<
+        PK: SignaturePublicKey<PK_LEN>,
+        SK: SignaturePrivateKey<SK_LEN>,
+        const PK_LEN: usize,
+        const SK_LEN: usize,
+    >(
+        &self,
+        keygen: fn() -> Result<(PK, SK), SignatureError>,
+    ) {
+        let (pk, sk) = keygen().unwrap();
+
+        let pk_bytes = pk.encode();
+        assert_eq!(pk_bytes.len(), PK_LEN);
+        // too short
+        match PK::from_bytes(&pk_bytes[..PK_LEN - 1]) {
+            Err(SignatureError::DecodingError(_)) => { /* good */ }
+            _ => panic!("Should have failed"),
+        }
+        // too long
+        let mut bytes_too_long: Vec<u8> = Vec::with_capacity(PK_LEN + 1);
+        bytes_too_long.append(&mut Vec::from(&pk_bytes[..PK_LEN]));
+        bytes_too_long.push(0xFF);
+        match PK::from_bytes(&bytes_too_long) {
+            Err(SignatureError::DecodingError(_)) => { /* good */ }
+            _ => panic!("Should have failed"),
+        }
+
+        let sk_bytes = sk.encode();
+        assert_eq!(sk_bytes.len(), SK_LEN);
+        // too short
+        match SK::from_bytes(&sk_bytes[..SK_LEN - 1]) {
+            Err(SignatureError::DecodingError(_)) => { /* good */ }
+            _ => panic!("Should have failed"),
+        }
+        // too long
+        let mut bytes_too_long: Vec<u8> = Vec::with_capacity(SK_LEN + 1);
+        bytes_too_long.append(&mut Vec::from(&sk_bytes[..SK_LEN]));
+        bytes_too_long.push(0xFF);
+        match SK::from_bytes(&bytes_too_long) {
+            Err(SignatureError::DecodingError(_)) => { /* good */ }
+            _ => panic!("Should have failed"),
+        }
+    }
+}

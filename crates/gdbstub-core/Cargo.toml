@@ -1,0 +1,28 @@
+# GDB remote-serial-protocol layer, shared by the Rust firmware's
+# on-token stub and a host harness that drives it with no board.
+#
+# Split out for exactly the reason the C port has `-DPQF_GDB_HOST`: the
+# protocol is where the bugs live, and it is testable against a real
+# arm-none-eabi-gdb without hardware. What stays in the firmware is the
+# part that genuinely needs silicon -- the DebugMonitor trampoline, the
+# FPB and DEMCR writes, and the USB transport.
+[package]
+name = "pqf-gdbstub-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "pqf_gdbstub_core"
+path = "src/lib.rs"
+
+[dev-dependencies]
+libc = "0.2"
+
+[features]
+# Host harness support: pulls in std for the pty example.
+std = []
+
+[[example]]
+name = "pty"
+required-features = ["std"]

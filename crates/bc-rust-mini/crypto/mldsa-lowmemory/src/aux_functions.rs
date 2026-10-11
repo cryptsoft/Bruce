@@ -1,0 +1,778 @@
+//! Implements auxiliary functions for ML-DSA as defined in Section 7 of FIPS 204.
+
+use crate::mldsa::{G, H, POLY_T0PACKED_LEN};
+use crate::mldsa::{N, POLY_T1PACKED_LEN, d, q};
+use crate::params::{
+    GAMMA1_2_POW_17, GAMMA1_2_POW_19, GAMMA2_Q_MINUS_1_OVER_32, GAMMA2_Q_MINUS_1_OVER_88,
+    MLDSAParams,
+};
+use crate::polynomial::Polynomial;
+use bouncycastle_core::traits::XOF;
+use bouncycastle_utils::secret::ZeroizablePrimitive;
+
+/// Algorithm 14 CoeffFromThreeBytes(b0, b1, b2)
+/// Output: An integer modulo q or bot.
+pub(crate) fn coeff_from_three_bytes(b: &[u8; 3]) -> Result<i32, ()> {
+    // This is the exact alg from FIPS 204:
+    // let mut b2_prime = b2;
+    // if b2_prime > 127 {
+    //     // Set the top bit of b2_prime to 0
+    //     b2_prime = b2_prime - 128;
+    // }
+
+    // but this is equivalent and feels more constant-time:
+    let b2_prime = b[2] & 0x7F;
+
+    let z: i32 = ((b2_prime as i32) << 16) | ((b[1] as i32) << 8) | (b[0] as i32);
+
+    // mutants note: yeah, this could be z <= q and nothing changes because z == q is the same as z == 0
+    if z < q { Ok(z) } else { Err(()) }
+}
+
+/// Algorithm 15 CoeffFromHalfByte(b)
+/// Let eta in {2, 4}. Generates an element of {-eta, -eta + 1, ... , eta} U {bot}.
+/// Input: Integer b in {0, 1, ... , 15}.
+/// Output: An integer between -eta and eta, or bot.
+#[inline(always)]
+pub(crate) fn coeff_from_half_byte<P: MLDSAParams>(b: u8) -> Result<i32, ()> {
+    if P::eta == 2 && b < 15 {
+        // Original code is bad because '%' is not constant-time.
+        // Ok(2 - (b % 5) as i32)
+        // TODO: Verify whether this function is constant time and whether it can be further optimized
+        let b = match b {
+            b if b < 5 => b,
+            b if b < 10 => b - 5,
+            _ => b - 10,
+        };
+        Ok(2 - b as i32)
+    } else {
+        if P::eta == 4 && b < 9 {
+            Ok(4 - b as i32)
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// A specific instantiation of Algorithm 16 SimpleBitPack(w, b) with the constants set for packing the t1 vector
+/// Encodes a polynomial w into a byte string.
+/// Input: b in N and w in R such that the coefficients of w are all in [0, b].
+/// Output: A byte string of length 32 * bitlen b.
+pub(crate) fn simple_bit_pack_t1(w: &Polynomial) -> [u8; POLY_T1PACKED_LEN] {
+    let mut output = [0u8; POLY_T1PACKED_LEN];
+    for i in 0..N / 4 {
+        output[5 * i] = w[4 * i] as u8;
+        output[5 * i + 1] = ((w[4 * i] >> 8) | (w[4 * i + 1] << 2)) as u8;
+        output[5 * i + 2] = ((w[4 * i + 1] >> 6) | (w[4 * i + 2] << 4)) as u8;
+        output[5 * i + 3] = ((w[4 * i + 2] >> 4) | (w[4 * i + 3] << 6)) as u8;
+        output[5 * i + 4] = (w[4 * i + 3] >> 2) as u8;
+    }
+    output
+}
+
+/// A variant of Algorithm 17 BitPack specific to a=eta, b=eta
+/// Encodes a polynomial w into a byte string.
+/// Input: a, b in N and w in R such that the coefficients of w are all in \[-eta, eta].
+/// Output: A byte string of length 32 * bitlen (a + b).
+// `match ETA` folds away per monomorphization (ETA is a const generic), so ETA = 2
+// and ETA = 4 each compile to just their own arm, leaving no dispatch at runtime.
+#[inline(always)]
+pub(crate) fn bit_pack_eta<P: MLDSAParams>(w: &Polynomial, r: &mut [u8]) {
+    debug_assert_eq!(r.len(), P::POLY_ETA_PACKED_LEN);
+
+    // temp swap space
+    let mut t: [u8; 8] = [0; 8];
+
+    match P::eta {
+        // MLDSA-44 and MLDSA-87
+        2 => {
+            let eta: i32 = 2;
+            for i in 0..N / 8 {
+                t[0] = (eta - w[8 * i]) as u8;
+                t[1] = (eta - w[8 * i + 1]) as u8;
+                t[2] = (eta - w[8 * i + 2]) as u8;
+                t[3] = (eta - w[8 * i + 3]) as u8;
+                t[4] = (eta - w[8 * i + 4]) as u8;
+                t[5] = (eta - w[8 * i + 5]) as u8;
+                t[6] = (eta - w[8 * i + 6]) as u8;
+                t[7] = (eta - w[8 * i + 7]) as u8;
+
+                r[3 * i] = t[0] | (t[1] << 3) | (t[2] << 6);
+                r[3 * i + 1] = (t[2] >> 2) | (t[3] << 1) | (t[4] << 4) | (t[5] << 7);
+                r[3 * i + 2] = (t[5] >> 1) | (t[6] << 2) | (t[7] << 5);
+            }
+        }
+        // MLDSA-65
+        4 => {
+            let eta: i32 = 4;
+            for i in 0..N / 2 {
+                t[0] = (eta - w[2 * i]) as u8;
+                t[1] = (eta - w[2 * i + 1]) as u8;
+                r[i] = t[0] | t[1] << 4;
+            }
+        }
+        _ => panic!("Invalid eta value"),
+    }
+}
+
+/// A variant of Algorithm 17 BitPack specific to packing the t0 polynomial with a=2^{d-1}-1, b=2^{d-1}
+/// Encodes a polynomial w into a byte string.
+/// Input: a, b in N and w in R such that the coefficients of w are all in \[-eta, eta].
+/// Output: A byte string of length 32 * bitlen (a + b).
+pub(crate) fn bit_pack_t0(t0: &Polynomial) -> [u8; POLY_T0PACKED_LEN] {
+    let mut r = [0u8; POLY_T0PACKED_LEN];
+
+    let mut t = [0; 8];
+    for i in 0..N / 8 {
+        t[0] = (1 << (d - 1)) - t0[8 * i];
+        t[1] = (1 << (d - 1)) - t0[8 * i + 1];
+        t[2] = (1 << (d - 1)) - t0[8 * i + 2];
+        t[3] = (1 << (d - 1)) - t0[8 * i + 3];
+        t[4] = (1 << (d - 1)) - t0[8 * i + 4];
+        t[5] = (1 << (d - 1)) - t0[8 * i + 5];
+        t[6] = (1 << (d - 1)) - t0[8 * i + 6];
+        t[7] = (1 << (d - 1)) - t0[8 * i + 7];
+
+        r[13 * i] = t[0] as u8;
+        r[13 * i + 1] = (t[0] >> 8) as u8;
+        r[13 * i + 1] |= (t[1] << 5) as u8;
+        r[13 * i + 2] = (t[1] >> 3) as u8;
+        r[13 * i + 3] = (t[1] >> 11) as u8;
+        r[13 * i + 3] |= (t[2] << 2) as u8;
+        r[13 * i + 4] = (t[2] >> 6) as u8;
+        r[13 * i + 4] |= (t[3] << 7) as u8;
+        r[13 * i + 5] = (t[3] >> 1) as u8;
+        r[13 * i + 6] = (t[3] >> 9) as u8;
+        r[13 * i + 6] |= (t[4] << 4) as u8;
+        r[13 * i + 7] = (t[4] >> 4) as u8;
+        r[13 * i + 8] = (t[4] >> 12) as u8;
+        r[13 * i + 8] |= (t[5] << 1) as u8;
+        r[13 * i + 9] = (t[5] >> 7) as u8;
+        r[13 * i + 9] |= (t[6] << 6) as u8;
+        r[13 * i + 10] = (t[6] >> 2) as u8;
+        r[13 * i + 11] = (t[6] >> 10) as u8;
+        r[13 * i + 11] |= (t[7] << 3) as u8;
+        r[13 * i + 12] = (t[7] >> 5) as u8;
+    }
+
+    r
+}
+
+/// A variant of Algorithm 17 specific to packing z in the signature value in \[-gamma1 + 1, gamma1].
+/// The destination is a slice rather than a `P::PolyZPacked`: the only caller writes straight into
+/// its window of the signature buffer, which is chunked at runtime because the chunk size
+/// `P::POLY_Z_PACKED_LEN` cannot be a const generic argument.
+pub(crate) fn bitpack_gamma1<P: MLDSAParams>(z: &Polynomial, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), P::POLY_Z_PACKED_LEN);
+    out.fill(0);
+
+    let mut t: [u32; 4] = [0; 4];
+    match P::gamma1 {
+        // MLDSA-44
+        GAMMA1_2_POW_17 => {
+            for i in 0..N / 4 {
+                t[0] = (P::gamma1 - z[4 * i]) as u32;
+                t[1] = (P::gamma1 - z[4 * i + 1]) as u32;
+                t[2] = (P::gamma1 - z[4 * i + 2]) as u32;
+                t[3] = (P::gamma1 - z[4 * i + 3]) as u32;
+
+                out[9 * i] = t[0] as u8;
+                out[9 * i + 1] = (t[0] >> 8) as u8;
+                out[9 * i + 2] = ((t[0] >> 16) | (t[1] << 2)) as u8;
+                out[9 * i + 3] = (t[1] >> 6) as u8;
+                out[9 * i + 4] = ((t[1] >> 14) | (t[2] << 4)) as u8;
+                out[9 * i + 5] = (t[2] >> 4) as u8;
+                out[9 * i + 6] = ((t[2] >> 12) | (t[3] << 6)) as u8;
+                out[9 * i + 7] = (t[3] >> 2) as u8;
+                out[9 * i + 8] = (t[3] >> 10) as u8;
+            }
+        }
+        // MLDSA-65 and -87 have the same GAMMA1 value
+        GAMMA1_2_POW_19 => {
+            for i in 0..N / 2 {
+                t[0] = (P::gamma1 - z[2 * i]) as u32;
+                t[1] = (P::gamma1 - z[2 * i + 1]) as u32;
+
+                out[5 * i] = t[0] as u8;
+                out[5 * i + 1] = (t[0] >> 8) as u8;
+                out[5 * i + 2] = ((t[0] >> 16) | (t[1] << 4)) as u8;
+                out[5 * i + 3] = (t[1] >> 4) as u8;
+                out[5 * i + 4] = (t[1] >> 12) as u8;
+            }
+        }
+        _ => {
+            panic!("Invalid gamma1 value")
+        }
+    }
+}
+
+/// A specific instantiation of Algorithm 18 SimpleBitUnpack(v, b) with the constants set for unpacking the t1 vector
+/// Input: b in N and a byte string v of length 32 * bitlen b.
+/// Output: A polynomial w in R with coefficients in [0, 2c - 1], where c = bitlen b.
+/// When b + 1 is a power of 2, the coefficients are in [0, b].
+///
+/// Note: caller is responsible for ensuring correct input array size
+pub(crate) fn simple_bit_unpack_t1(v: &[u8; POLY_T1PACKED_LEN]) -> Polynomial {
+    let mut w = Polynomial::new();
+
+    for i in 0..N / 4 {
+        w[4 * i] = ((v[5 * i] as i32) | ((v[5 * i + 1] as i32) << 8)) & 0x3FF;
+        w[4 * i + 1] = (((v[5 * i + 1] as i32) >> 2) | ((v[5 * i + 2] as i32) << 6)) & 0x3FF;
+        w[4 * i + 2] = (((v[5 * i + 2] as i32) >> 4) | ((v[5 * i + 3] as i32) << 4)) & 0x3FF;
+        w[4 * i + 3] = (((v[5 * i + 3] as i32) >> 6) | ((v[5 * i + 4] as i32) << 2)) & 0x3FF;
+    }
+
+    w
+}
+
+/// A variant of Algorithm 19 BitUnpack specific to a=eta, b=eta
+/// Input: a, b in N and a byte string v of length 32 * bitlen (a + b).
+/// Output: A polynomial w in R with coefficients in [b - 2c + 1, b], where c = bitlen (a + b).
+/// When a + b + 1 is a power of 2, the coefficients are in [-a, b].
+///
+/// Note: caller is responsible for ensuring correct input array size
+
+// `match ETA` folds away per monomorphization (ETA is a const generic), so ETA = 2
+// and ETA = 4 each compile to just their own arm, leaving no dispatch at runtime.
+#[inline(always)]
+pub(crate) fn bit_unpack_eta_out<P: MLDSAParams>(v: &[u8], w: &mut Polynomial) {
+    debug_assert_eq!(v.len(), P::POLY_ETA_PACKED_LEN);
+
+    match P::eta {
+        // MLDSA44 and MLDSA87
+        2 => {
+            let eta: i32 = 2;
+            for i in 0..N / 8 {
+                w[8 * i] = (v[3 * i] & 7) as i32;
+                w[8 * i + 1] = ((v[3 * i] >> 3) & 7) as i32;
+                w[8 * i + 2] = ((v[3 * i] >> 6) | (v[3 * i + 1] << 2) & 7) as i32;
+                w[8 * i + 3] = ((v[3 * i + 1] >> 1) & 7) as i32;
+                w[8 * i + 4] = ((v[3 * i + 1] >> 4) & 7) as i32;
+                w[8 * i + 5] = ((v[3 * i + 1] >> 7) | (v[3 * i + 2] << 1) & 7) as i32;
+                w[8 * i + 6] = ((v[3 * i + 2] >> 2) & 7) as i32;
+                w[8 * i + 7] = ((v[3 * i + 2] >> 5) & 7) as i32;
+
+                w[8 * i] = eta - w[8 * i];
+                w[8 * i + 1] = eta - w[8 * i + 1];
+                w[8 * i + 2] = eta - w[8 * i + 2];
+                w[8 * i + 3] = eta - w[8 * i + 3];
+                w[8 * i + 4] = eta - w[8 * i + 4];
+                w[8 * i + 5] = eta - w[8 * i + 5];
+                w[8 * i + 6] = eta - w[8 * i + 6];
+                w[8 * i + 7] = eta - w[8 * i + 7];
+            }
+        }
+        // MLDSA65
+        4 => {
+            let eta: i32 = 4;
+            for i in 0..N / 2 {
+                w[2 * i] = (v[i] & 0x0F) as i32;
+                w[2 * i + 1] = (v[i] >> 4) as i32;
+
+                w[2 * i] = eta - w[2 * i];
+                w[2 * i + 1] = eta - w[2 * i + 1];
+            }
+        }
+        _ => panic!("Invalid eta value"),
+    }
+}
+
+/// A variant of Algorithm 19 BitUnpack specific to a=gamma1 - 1, b=gamma1
+/// Input: a, b in N and a byte string v of length 32 * bitlen (a + b).
+/// Output: A polynomial w in R with coefficients in [b - 2c + 1, b], where c = bitlen (a + b).
+/// When a + b + 1 is a power of 2, the coefficients are in [-a, b].
+///
+/// Note: caller is responsible for ensuring correct input array size
+
+// `match ETA` folds away per monomorphization (ETA is a const generic), so ETA = 2
+// and ETA = 4 each compile to just their own arm, leaving no dispatch at runtime.
+#[inline(always)]
+pub(crate) fn bit_unpack_gamma1<P: MLDSAParams>(v: &[u8]) -> Polynomial {
+    let mut w = Polynomial::new();
+
+    match P::gamma1 {
+        // MLDSA-44
+        GAMMA1_2_POW_17 => {
+            // const gamma1: i32 = 1<<17;
+            for i in 0..N / 4 {
+                w[4 * i] = (((v[9 * i] as i32) | ((v[9 * i + 1] as i32) << 8))
+                    | ((v[9 * i + 2] as i32) << 16))
+                    & 0x3FFFF;
+                w[4 * i + 1] = ((((v[9 * i + 2] as i32) >> 2) | ((v[9 * i + 3] as i32) << 6))
+                    | ((v[9 * i + 4] as i32) << 14))
+                    & 0x3FFFF;
+                w[4 * i + 2] = ((((v[9 * i + 4] as i32) >> 4) | ((v[9 * i + 5] as i32) << 4))
+                    | ((v[9 * i + 6] as i32) << 12))
+                    & 0x3FFFF;
+                w[4 * i + 3] = ((((v[9 * i + 6] as i32) >> 6) | ((v[9 * i + 7] as i32) << 2))
+                    | ((v[9 * i + 8] as i32) << 10))
+                    & 0x3FFFF;
+
+                w[4 * i] = P::gamma1 - w[4 * i];
+                w[4 * i + 1] = P::gamma1 - w[4 * i + 1];
+                w[4 * i + 2] = P::gamma1 - w[4 * i + 2];
+                w[4 * i + 3] = P::gamma1 - w[4 * i + 3];
+            }
+        }
+        // MLDSA-65 and -87 have the same GAMMA1 value
+        GAMMA1_2_POW_19 => {
+            // const gamma1: i32 = 1<<19;
+            for i in 0..N / 2 {
+                w[2 * i] = (((v[5 * i] as i32) | ((v[5 * i + 1] as i32) << 8))
+                    | ((v[5 * i + 2] as i32) << 16))
+                    & 0xFFFFF;
+                w[2 * i + 1] = ((((v[5 * i + 2] as i32) >> 4) | ((v[5 * i + 3] as i32) << 4))
+                    | ((v[5 * i + 4] as i32) << 12))
+                    & 0xFFFFF;
+
+                w[2 * i] = P::gamma1 - w[2 * i];
+                w[2 * i + 1] = P::gamma1 - w[2 * i + 1];
+            }
+        }
+        _ => {
+            panic!("Invalid gamma1 value")
+        }
+    };
+
+    w
+}
+
+/// Part of unpacking the sig value
+pub(crate) fn unpack_c_tilde<P: MLDSAParams>(sig: &[u8]) -> P::SigCTilde {
+    let mut c_tilde = <P::SigCTilde as ZeroizablePrimitive>::ZEROED;
+    c_tilde.as_mut().copy_from_slice(&sig[..P::C_TILDE_LEN]);
+    c_tilde
+}
+
+/// Part of unpacking the sig value
+pub(crate) fn unpack_z_row<P: MLDSAParams, const SIG_LEN: usize>(
+    idx: usize,
+    sig: &[u8; SIG_LEN],
+) -> Result<Polynomial, ()> {
+    debug_assert!(idx < P::l);
+
+    // skip to the start of the z's
+    let pos = P::C_TILDE_LEN;
+    let z = bit_unpack_gamma1::<P>(
+        &sig[pos + idx * P::POLY_Z_PACKED_LEN..pos + (idx + 1) * P::POLY_Z_PACKED_LEN],
+    );
+
+    // Perform the norm check from
+    // Alg 8; Line 13 (first half) return [[ ||z||inf < gamma1 - beta]]
+    if z.check_norm(P::gamma1_minus_beta) {
+        Err(())
+    } else {
+        Ok(z)
+    }
+}
+/// Part of unpacking the sig value
+pub(crate) fn unpack_h_row<P: MLDSAParams, const SIG_LEN: usize>(
+    row: usize,
+    sig: &[u8; SIG_LEN],
+) -> Option<Polynomial> {
+    debug_assert!(row < P::k);
+
+    let mut h = Polynomial::new();
+
+    // skip over the other stuff in the encoded sig value
+    let pos = P::C_TILDE_LEN + P::l * P::POLY_Z_PACKED_LEN;
+
+    // This inlines Algorithm 21 HintBitUnpack(y)
+
+    // 2: Index <- 0
+    //  // Index for reading the first omega bytes of y
+    // let mut idx = 0usize;
+    // This row calc is a bit weird because technically it's supposed to be done at the end
+    // of the previous loop
+    let idx = if row == 0 {
+        0
+    } else {
+        sig[pos + P::omega as usize + row - 1] as usize
+    };
+
+    // 3: for i from 0 to k - 1 do
+    //  // reconstruct h[i]
+    // for i in 0..k {
+    // 4: if y[omega + i] < Index or y[omega + i] > omega then return bot
+    // mutants note: don't have test vectors that exercise this condition
+    if sig[pos + (P::omega as usize) + row] < (idx as u8)
+        || sig[pos + (P::omega as usize) + row] > P::omega as u8
+    {
+        return None;
+    }
+
+    // 6: First <- Index
+    // 7: while Index < y[omega + i] do
+    //   // y[omega + i] says how far one can advance Index
+    for j in idx..sig[pos + P::omega as usize + row] as usize {
+        // 8: if Index > First then
+        // 9:   if y[Index - 1] >= y[Index] then return bot
+        //       // malformed input
+        // mutants note: don't have test vectors that exercise this condition
+        if j > idx && sig[pos + j - 1] >= sig[pos + j] {
+            return None;
+        }
+        // 12: h[i]_y[Index] <- 1
+        h[sig[pos + j] as usize] = 1;
+
+        // 13: Index <- Index + 1
+        //  > done by for loop
+    }
+
+    // // read any leftover bytes in the first omega bytes of y for malformed (nonzero) bytes
+    // mutants note:
+    if row == P::k - 1 {
+        let idx = sig[pos + P::omega as usize + row] as usize;
+        for j in idx..P::omega as usize {
+            if sig[pos + j] != 0 {
+                return None;
+            }
+        }
+    }
+
+    Some(h)
+}
+
+/// Algorithm 29 SampleInBall(rho)
+/// Samples a polynomial c in R with coefficients from {-1, 0, 1} and Hamming weight tau <= 64.
+/// Input: A seed rho in Blambda/4
+/// Output: A polynomial c in R.
+pub(crate) fn sample_in_ball<P: MLDSAParams>(rho: &P::SigCTilde) -> Polynomial {
+    // 1: c <- 0
+    let mut c = Polynomial::new();
+
+    // 2: ctx <- H.Init()
+    // 3: ctx <- H.Absorb(ctx, rho)
+    // 4: (ctx, s) <- H.Squeeze(ctx, 8)
+    let mut h = H::new();
+    h.absorb(rho.as_ref())
+        .expect("absorb before squeeze is infallible");
+    let mut s = [0u8; 8];
+    h.squeeze_out(&mut s);
+
+    // 5: h <- BytesToBits(s)
+    //   // h is a bit string of length 64
+    let mut signs: u64 = 0;
+    for (i, item) in s.iter().enumerate().take(8) {
+        signs |= (*item as u64) << (8 * i);
+    }
+
+    // 6: for i from 256 - tau to 255 do
+
+    // let mut pos = 8;
+    // let mut b;
+    let mut j = [0u8];
+    for i in (N - P::tau as usize)..N {
+        // 7: (ctx, j) <- H.Squeeze(ctx, 1)
+        // Note: At first, it might seem to be faster to pre-squeeze a buffer outside the loop.
+        // However, after experimentation and testing, the difference is not noticeable.
+        h.squeeze_out(&mut j);
+
+        // 8: while j > i do
+        while j[0] as usize > i {
+            // // rejection sampling in {0, ... , i}
+            // 9: (ctx, j) <- H.Squeeze(ctx, 1)
+            h.squeeze_out(&mut j);
+        }
+
+        // 11: ci <- cj
+        c[i] = c[j[0] as usize];
+
+        // 12: cj <- (-1)^h[i+tau-256]
+        c[j[0] as usize] = (1u64.wrapping_sub(2 * (signs & 1))) as i32;
+        signs >>= 1;
+    }
+
+    // check post-condition
+    // coefficients from {-1, 0, 1} and Hamming weight tau <= 64.
+    #[cfg(debug_assertions)]
+    {
+        let mut hamming_weight: i32 = 0;
+        for i in 0..N {
+            debug_assert!((-1..=1).contains(&c[i]));
+            if c[i] != 0 {
+                hamming_weight += 1;
+            }
+        }
+        debug_assert!(hamming_weight > 0);
+        debug_assert!(hamming_weight <= 64);
+    }
+
+    c
+}
+
+/// Algorithm 30 RejNTTPoly(rho)
+/// This is supposed to take a rho: [u8; 34], which is: rho||IntegerToBytes(s, 1)||IntegerToBytes(r, 1)
+/// but to avoid needing to copy bytes and allocate more memory,
+/// here that is split into a [u8;32] and a [u8;2]
+pub(crate) fn rej_ntt_poly(rho: &[u8; 32], nonce: &[u8; 2]) -> Polynomial {
+    let mut w_hat = Polynomial::new();
+    let mut j: usize = 0;
+    let mut g = G::new();
+    g.absorb(rho).expect("absorb before squeeze is infallible");
+    g.absorb(nonce)
+        .expect("absorb before squeeze is infallible");
+
+    // SHAKE is fairly inefficient if only 3 bytes are squeezed at a time, so the implementation does a block instead.
+    // size is not a limitation, so long as it's a multiple of 3.
+    // 288 seemed to be the sweet spot from playing with benchmarks
+    // It's probably around the average rejection rate, and 288 is a multiple of both 3 (required for this alg)
+    // and 8 (efficient for SHAKE).
+    let mut s = [0u8; 288];
+    g.squeeze_out(&mut s);
+    let mut idx: usize = 0;
+
+    while j < N {
+        if idx == s.len() {
+            g.squeeze_out(&mut s);
+            idx = 0;
+        }
+        w_hat[j] = match coeff_from_three_bytes(&s[idx..idx + 3].try_into().unwrap()) {
+            Ok(c) => c,
+            Err(_) => {
+                // those three bytes were out of range for a coefficient, so go again with the next three bytes
+                // from the SHAKE stream.
+                idx += 3;
+                continue;
+            }
+        };
+        idx += 3;
+        j += 1;
+    }
+
+    w_hat
+}
+
+/// Algorithm 31 RejBoundedPoly(rho)
+/// Samples an element a in R with coefficients in \[-eta, eta\] computed via rejection sampling from rho.
+/// Input: A seed rho in B66 .
+/// Output: A polynomial a in R.
+///
+/// This is supposed to take a rho: [u8; 66], which is: rho||IntegerToBytes(s, 1)||IntegerToBytes(r, 1)
+/// but to avoid needing to copy bytes and allocate more memory,
+/// here that is split into a [u8;64] and a [u8;2]
+pub(crate) fn rej_bounded_poly<P: MLDSAParams>(rho: &[u8; 64], nonce: &[u8; 2]) -> Polynomial {
+    let mut a = Polynomial::new();
+    let mut j: usize = 0;
+    let mut h = H::new();
+    h.absorb(rho).expect("absorb before squeeze is infallible");
+    h.absorb(nonce)
+        .expect("absorb before squeeze is infallible");
+
+    // SHAKE is fairly inefficient if only 3 bytes are squeezed at a time, so the implementation does a block instead.
+    // size is not a limitation as long as it is a multiple of 3.
+    // 312 seems to be the sweet spot after some experimentation
+    // which is possibly also related with the average rejection rate.
+    // Also, 312 is a multiple of 8 (efficient for SHAKE)
+    let mut z_arr = [0u8; 312];
+    h.squeeze_out(&mut z_arr);
+    let mut idx: usize = 0;
+
+    while j < N {
+        let z0 = coeff_from_half_byte::<P>(z_arr[idx] & 0x0F); // equiv to % 16 (but faster, and more importantly, constant-time)
+        let z1 = coeff_from_half_byte::<P>(z_arr[idx] >> 4); // equiv to div_floor(16) (but faster, and more importantly, constant-time)
+
+        if z0.is_ok() {
+            a[j] = z0.unwrap();
+            j += 1;
+        } /* else: do nothing */
+        if z1.is_ok() && j < 256 {
+            a[j] = z1.unwrap();
+            j += 1;
+        } /* else: do nothing */
+
+        idx += 1;
+        if idx == z_arr.len() {
+            h.squeeze_out(&mut z_arr);
+            idx = 0;
+        }
+    }
+
+    a
+}
+
+/// Algorithm 34 ExpandMask(rho, mu)
+/// Samples a vector y in Rl such that each polynomial y[r] has coefficients between -gamma1 + 1 and gamma1.
+/// Input: A seed rho in B64 and a nonnegative integer mu.
+/// Output: Vector y in Rl .
+pub(crate) fn expand_mask_poly<P: MLDSAParams>(rho: &[u8; 64], nonce: u16) -> Polynomial {
+    // 1: c <- 1 + bitlen (gamma1 - 1)
+    //  // gamma1 is always a power of 2
+    // 3: rho' <- rho||IntegerToBytes(mu + r, 2)
+    // 4: v <- H(rho', 32c)
+    // The 32c bytes squeezed on line 4 are exactly `P::POLY_Z_PACKED_LEN`, so the buffer for them
+    // is `P::PolyZPacked`; see the docs on `MLDSAParams::POLY_Z_PACKED_LEN`.
+    let mut h = H::new();
+    h.absorb(rho).expect("absorb before squeeze is infallible");
+    h.absorb(&nonce.to_le_bytes())
+        .expect("absorb before squeeze is infallible");
+    let mut v = <P::PolyZPacked as ZeroizablePrimitive>::ZEROED;
+    h.squeeze_out(v.as_mut());
+    bit_unpack_gamma1::<P>(v.as_ref())
+}
+
+/// Algorithm 35 Power2Round(r)
+/// Decomposes r into (r1, r0) such that r == r1 2^d + r0 mod q.
+/// Input: r in Zq.
+/// Output: Integers (r1, r0).
+pub(crate) fn power_2_round(r: i32) -> (i32, i32) {
+    const u: i32 = (1 << (d - 1)) - 1;
+    const v: i32 = -1 << d;
+
+    let t = r + u;
+    let r0 = r - (t & v);
+
+    (t >> d, r0)
+}
+
+#[test]
+// FIPS 204 describes the output as easy to check:
+// Decomposes r into (r1, r0) such that r == r1 2^d + r0 mod q.
+fn test_power_2_round() {
+    test(1);
+    test(q - 3);
+    test(q);
+    test(q + 3);
+
+    fn test(r: i32) {
+        let (r1, r0) = power_2_round(r);
+        let mut res = ((r1 << d) + r0) % q;
+        if res < 0 {
+            res += q;
+        }
+        assert_eq!(r % q, res);
+    }
+}
+
+/// Algorithm 36 Decompose(r)
+/// Decomposes r into (r1, r0) such that r == r1(2gamma2) + r0 mod q.
+/// Input: r in Zq.
+/// Output: Integers (r1, r0).
+// the hope here is that the compiler will aggressively inline this function,
+// and optimize away the branching.
+#[inline(always)]
+pub(crate) fn decompose<P: MLDSAParams>(r: i32) -> (i32, i32) {
+    // 1: r+ <- r mod q
+    // 2: r0 <- r+ mod+-(2gamma2)
+    // 3: if r+ - r0 = q - 1 then
+    // 4:   r1 <- 0
+    // 5:   r0 <- r0 - 1
+    // 6: else r1 <- (r+ - r0)/(2gamma2)
+    // 7: end if
+    // 8: return (r1, r0)
+
+    // By the powers of someone much more clever than me, this is equivalent.
+
+    let mut r1: i32;
+    let mut r0 = (r + 127) >> 7;
+
+    match P::gamma2 {
+        // MLDSO-44
+        GAMMA2_Q_MINUS_1_OVER_88 => {
+            // (q - 1) / 88
+            r0 = (r0 * 11275 + (1 << 23)) >> 24;
+            r0 ^= ((43 - r0) >> 31) & r0;
+        }
+        // ML-DSA-65 and -87 have the same GAMMA2
+        GAMMA2_Q_MINUS_1_OVER_32 => {
+            // (q - 1) / 32;
+            r0 = (r0 * 1025 + (1 << 21)) >> 22;
+            r0 &= 15;
+        }
+        _ => {
+            // this branch should never compile
+            unimplemented!()
+        }
+    }
+
+    r1 = r - r0 * 2 * P::gamma2;
+
+    // mutants note: the choice of (q - 1) is a bit arbitrary in that after doing the bit-shifting,
+    // this seems to work out mathematically equivalent to doing q/2, or (q+3)/2, but here it is left as (q-1)/2
+    // since that's algorithmically correct, and just ignore the mutants results.
+    r1 -= (((q - 1) / 2 - r1) >> 31) & q;
+
+    (r0, r1)
+}
+
+/// Algorithm 37 HighBits(r)
+/// Returns r1 from the output of Decompose (r).
+/// Input: r in Zq.
+/// Output: Integer r1.
+pub(crate) fn high_bits<P: MLDSAParams>(r: i32) -> i32 {
+    // 1: (r1, r0) <- Decompose(r)
+    // 2: return r1
+    let (r1, _) = decompose::<P>(r);
+    r1
+}
+
+/// Algorithm 38 LowBits(r)
+/// Returns r0 from the output of Decompose (r).
+/// Input: r in Zq.
+/// Output: Integer r0.
+pub(crate) fn low_bits<P: MLDSAParams>(r: i32) -> i32 {
+    // 1: (r1, r0) <- Decompose(r)
+    // 2: return r0
+    let (_, r0) = decompose::<P>(r);
+    r0
+}
+
+/// Algorithm 39 MakeHint(z, r)
+/// Computes hint bit indicating whether adding z to r alters the high bits of r.
+/// Input: z, r in Zq.
+/// Output: Boolean.
+pub(crate) fn make_hint<P: MLDSAParams>(z: i32, r: i32) -> i32 {
+    // Naive implementation:
+    // // 1: r1 <- HighBits(r)
+    // let r1 = high_bits::<P>(r);
+    //
+    // // 2: v1 <- HighBits(r + z)
+    // let v1 = high_bits::<P>(r + z);
+    //
+    // // 3: return [[r1 != v1]]
+    // if r1 != v1 { 1 } else { 0 }
+
+    // By the powers of someone much more clever than me, this is equivalent.
+    // mutants note: we do not have KATs that exercise all branches of this if
+    if z <= P::gamma2 || z > q - P::gamma2 || (z == q - P::gamma2 && r == 0) {
+        0
+    } else {
+        1
+    }
+}
+
+/// Algorithm 40 UseHint(h, r)
+/// Returns the high bits of r adjusted according to hint h.
+/// Input: Boolean h, r in Zq.
+/// Output: r1 in Z with 0 <= r1 <= (q-1) / 2*gamma2).
+pub(super) fn use_hint<P: MLDSAParams>(a: i32, hint: i32) -> i32 {
+    let (a0, a1) = decompose::<P>(a);
+
+    if hint == 0 {
+        return a0;
+    }
+
+    debug_assert!(hint == 1);
+
+    match P::gamma2 {
+        // MLDSA-44
+        GAMMA2_Q_MINUS_1_OVER_88 => {
+            // mutants note: this passes unit tests if it's a1 >= 0
+            //      it is left like this because it matches the spec
+            if a1 > 0 {
+                if a0 == 43 { 0 } else { a0 + 1 }
+            } else {
+                if a0 == 0 { 43 } else { a0 - 1 }
+            }
+        }
+        // ML-DSA65 and -87 have the same GAMMA2
+        GAMMA2_Q_MINUS_1_OVER_32 => {
+            // mutants note: this passes unit tests if it's a0 >= 0
+            //      it is left like this because it matches the spec
+            if a1 > 0 { (a0 + 1) & 15 } else { (a0 - 1) & 15 }
+        }
+        _ => {
+            panic!("Invalid GAMMA2 value")
+        }
+    }
+}

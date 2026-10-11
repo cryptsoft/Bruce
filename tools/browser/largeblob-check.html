@@ -1,0 +1,175 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>largeBlob wire-format check</title>
+<style>
+  /* An explicit ground: a page with no background of its own borrows
+     the browser's, and this one's text is dark. */
+  :root { color-scheme: light; }
+  html { background: #fff; }
+  body { font: 15px/1.55 -apple-system, system-ui, sans-serif; max-width: 46rem;
+         margin: 2rem auto; padding: 0 1rem; color: #16181d; background: #fff; }
+  h1 { font-size: 1.35rem; margin-bottom: .2rem; }
+  .sub { color: #5b6270; margin-top: 0; }
+  button { font: inherit; padding: .5rem 1rem; border: 1px solid #b9bfcc;
+           border-radius: 6px; background: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #log { margin-top: 1.25rem; border: 1px solid #e2e5eb; border-radius: 8px; }
+  .row { padding: .55rem .8rem; border-bottom: 1px solid #eef0f4;
+         display: flex; gap: .6rem; align-items: baseline; }
+  .row:last-child { border-bottom: 0; }
+  .tag { font-weight: 600; flex: 0 0 4.5rem; }
+  .pass .tag { color: #1a7f4b; } .fail .tag { color: #b3261e; }
+  .info .tag { color: #5b6270; }
+  code { background: #f2f4f7; padding: .1rem .3rem; border-radius: 3px; }
+  .note { background: #f7f8fa; border-left: 3px solid #c8cdd8;
+          padding: .7rem .9rem; margin: 1rem 0; color: #3d434f; }
+</style>
+
+<h1>largeBlob wire-format check</h1>
+<p class="sub">Drives <code>authenticatorLargeBlobs</code> (CTAP 0x0C) through a real
+browser, which is the one client that was never written from this firmware.</p>
+
+<div class="note">
+  <strong>Run this twice.</strong> Once against a token built <em>before</em> the
+  parameter renumbering and once after. Before the fix the write step should
+  fail; after it, it should round-trip. A pass on the old firmware would mean
+  the whole finding is wrong, which is worth knowing more than a pass on the
+  new one.
+  <br><br>
+  Serve over <code>localhost</code> -- WebAuthn needs a secure context, so
+  <code>file://</code> will not do:
+  <code>python3 -m http.server -d tools/browser 8000</code>
+</div>
+
+<p><button id="go">Run</button></p>
+<div id="log"></div>
+
+<script>
+const log = document.getElementById('log');
+function say(kind, tag, text) {
+  const d = document.createElement('div');
+  d.className = 'row ' + kind;
+  d.innerHTML = '<span class="tag">' + tag + '</span><span></span>';
+  d.lastChild.textContent = text;
+  log.appendChild(d);
+}
+const pass = t => { say('pass', 'pass', t); report('pass', t); };
+const fail = t => { say('fail', 'FAIL', t); report('fail', t); };
+const info = t => { say('info', '/', t); report('info', t); };
+
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+// Composite COSE id of the default ML-DSA-65 build: the
+// draft-ietf-jose-pq-composite-sigs-04 request, still provisional.
+// Must match crates/signer-core/src/mldsa_alg.rs and c/firmware/src/hybrid.h.
+const ALG_MLDSA65_ES256 = -55;
+const dec = new TextDecoder(), enc = new TextEncoder();
+
+// Results are posted back to the server when the page is opened with
+// ?auto=1, so an unattended run can be read from a file rather than a
+// screen. Chrome still shows its own security-key dialog; that is
+// browser UI and nothing here can dismiss it.
+const AUTO = new URLSearchParams(location.search).has('auto');
+const results = [];
+function report(kind, text) { results.push({ kind, text }); }
+async function postBack(outcome) {
+  if (!AUTO) return;
+  try {
+    await fetch('/result', {
+      method: 'POST',
+      body: JSON.stringify({ outcome, results, ua: navigator.userAgent }),
+    });
+  } catch (e) { /* nothing useful to do from here */ }
+}
+
+document.getElementById('go').onclick = async () => {
+  document.getElementById('go').disabled = true;
+  log.innerHTML = '';
+  results.length = 0;
+  try {
+    info('Touch the token when it flashes. Three gestures in total.');
+
+    // 1. Register, asking for largeBlob support. If the authenticator
+    //    cannot support it, Chrome reports supported:false rather than
+    //    failing -- which is itself the answer we are looking for.
+    info('1/3 registering with the largeBlob extension...');
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: rand(32),
+      rp: { name: 'largeBlob check' },
+      user: { id: rand(16), name: 'wire-format', displayName: 'wire-format' },
+      pubKeyCredParams: [
+        { type: 'public-key', alg: ALG_MLDSA65_ES256 },   // ML-DSA-65 hybrid
+        { type: 'public-key', alg: -7 },    // ES256
+      ],
+      authenticatorSelection: {
+        authenticatorAttachment: 'cross-platform',
+        residentKey: 'required',
+      },
+      extensions: { largeBlob: { support: 'required' } },
+      timeout: 120000,
+    }});
+    const created = cred.getClientExtensionResults();
+    if (created.largeBlob && created.largeBlob.supported) {
+      pass('the token accepted a credential with largeBlob support');
+    } else {
+      fail('largeBlob support was refused at registration: '
+           + JSON.stringify(created.largeBlob));
+      info('That alone does not prove the numbering -- Chrome also needs the '
+           + 'largeBlobs option in getInfo, which this build advertises.');
+    }
+    const id = new Uint8Array(cred.rawId);
+
+    // 2. Write. This is the request whose parameter numbering was wrong:
+    //    a rotated get/set/offset made it unreachable.
+    const payload = 'wire-format-check ' + new Date().toISOString();
+    info('2/3 writing a blob...');
+    const w = await navigator.credentials.get({ publicKey: {
+      challenge: rand(32),
+      allowCredentials: [{ type: 'public-key', id }],
+      extensions: { largeBlob: { write: enc.encode(payload) } },
+      timeout: 120000,
+    }});
+    const wrote = w.getClientExtensionResults();
+    if (wrote.largeBlob && wrote.largeBlob.written) {
+      pass('the blob was written -- authenticatorLargeBlobs answered a real client');
+    } else {
+      fail('the write was refused: ' + JSON.stringify(wrote.largeBlob));
+      info('This is what the old parameter numbering looks like from a browser.');
+    }
+
+    // 3. Read it back. A write that reports success but reads back wrong
+    //    would be worse than a clean failure.
+    info('3/3 reading it back...');
+    const r = await navigator.credentials.get({ publicKey: {
+      challenge: rand(32),
+      allowCredentials: [{ type: 'public-key', id }],
+      extensions: { largeBlob: { read: true } },
+      timeout: 120000,
+    }});
+    const read = r.getClientExtensionResults();
+    if (read.largeBlob && read.largeBlob.blob) {
+      const back = dec.decode(new Uint8Array(read.largeBlob.blob));
+      if (back === payload) pass('the blob read back byte for byte');
+      else fail('the blob came back altered: ' + JSON.stringify(back));
+    } else {
+      fail('nothing read back: ' + JSON.stringify(read.largeBlob));
+    }
+
+    info('Credential management (CTAP 0x0A) is not reachable from a page. '
+         + 'Check it at chrome://settings/passkeys -- the credential this run '
+         + 'just made should be listed there, and deletable.');
+  } catch (e) {
+    fail(e && e.name ? e.name + ': ' + e.message : String(e));
+    info('A NotAllowedError usually means the gesture timed out or the '
+         + 'token refused. A NotSupportedError means the algorithm list was '
+         + 'not satisfiable.');
+  }
+  document.getElementById('go').disabled = false;
+  await postBack(results.some(r => r.kind === 'fail') ? 'fail' : 'pass');
+};
+
+// Unattended: start as soon as the page loads. WebAuthn's create() does
+// not require transient user activation in Chrome, so no click is
+// needed -- only Chrome's own dialog, which the token satisfies by
+// itself on an auto-confirm build.
+if (AUTO) addEventListener('load', () => document.getElementById('go').click());
+</script>

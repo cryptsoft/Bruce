@@ -1,0 +1,422 @@
+# Bare-metal Rust PQC FIDO2 firmware for the RP2350A (Pimoroni Tiny
+# 2350, Seeed XIAO RP2350, Feitian RP2350 and its sealed USB-C token,
+# Waveshare RP2350-LCD-1.47-B, Spotpear RP2350-LCD-1.28).
+#
+# Built on rp235x-hal directly (not Embassy) for tight control over the
+# RP2350-specific bringup: metadata block at 0x10000000, no boot stage 2,
+# the PHY_ISO/PULLDOWN_EN/DPRAM USB quirks. The CTAP 2.1 / WebAuthn
+# stack -- CBOR codec, command dispatch, credential storage, COSE keys,
+# attestation -- is implemented in this crate against the published
+# specs (RFC 8949 for CBOR, FIDO Alliance CTAP 2.1, W3C WebAuthn).
+# The hybrid PQC signing primitives come from `bc-rust` (Bouncy Castle
+# Rust port, low-memory variant); see `[dependencies]` below.
+#
+# Sibling crates in the workspace (../cbor, ../ctaphid-client) are
+# host-side helpers; this crate is the only one that targets the
+# embedded `thumbv8m.main-none-eabihf` triple.
+
+[package]
+name = "bruce"
+version = "0.1.0"
+edition = "2021"
+# Licensed under the Apache License, Version 2.0. See LICENSE and
+# THIRD_PARTY.md at the repository root. Two files are third-party derivations that keep
+# their own permissive licences: src/board/bootsel.rs (BSD-3-Clause,
+# from Raspberry Pi pico-examples) and the OpenSK-derived protocol
+# surface (Apache-2.0 attribution in LICENSE-APACHE-OPENSK).
+license = "Apache-2.0"
+
+[[bin]]
+name = "bruce"
+path = "src/main.rs"
+
+# Standalone hardware bring-up tool, not part of the FIDO2 firmware --
+# see `src/bin/button_scan.rs` module doc. Independent crate root, no
+# `mod` sharing with `main.rs`; needs no board/mldsa feature to build.
+[[bin]]
+name = "button_scan"
+path = "src/bin/button_scan.rs"
+
+# Selects which ML-DSA security level the firmware builds against. The
+# three are mutually exclusive -- `cargo build` with `--no-default-features`
+# + exactly one of `mldsa44` / `mldsa65` / `mldsa87`, or just rely on
+# `mldsa65` as the default. The chosen feature drives:
+#   - the lowmem-crate type alias (`mldsa_alg::MLDSA`, `MLDSAPublicKey`)
+#     and the SIG / PK length constants,
+#   - the COSE algorithm identifier we advertise in `getInfo` and emit
+#     in the COSE_Key (composite PQ/T alg = -54 / -55 / -56 respectively,
+#     as requested in draft-ietf-jose-pq-composite-sigs-04; defined once
+#     in crates/signer-core/src/mldsa_alg.rs),
+#   - the hybrid signature size (~2420 / 3309 / 4627 B for ML-DSA-44 /
+#     65 / 87) -- relevant for sizing the response buffer in core1_signer
+#     and for the RP-side `attestationObject` column.
+#
+# Build incantations (from this directory, `crates/firmware/`):
+#   cargo build --release --no-default-features --features mldsa44
+#   cargo build --release                              # implicit mldsa65
+#   cargo build --release --no-default-features --features mldsa87
+#
+# Or from the workspace root with `-p bruce`.
+[features]
+# Default: ML-DSA-65 + Pimoroni Tiny 2350 RGB LED layout.
+default = ["mldsa65", "board_tiny2350"]
+# The level choice is forwarded to pqf-signer-core, which owns the
+# crypto-level aliases (MLDSA type, MLDSA_SIG_LEN, ...) and sizes the
+# cross-core mailbox from them; the mixed-architecture blob forwards
+# the same choice, so firmware and blob can never disagree.
+# On-token GDB stub over a second USB CDC interface (docs/GDB_DEBUG.md).
+#
+# Arm only -- it is built on the ARMv8-M DebugMonitor exception and the
+# FPB, neither of which the Hazard3 has. Default OFF and excluded from
+# production images: it is an unauthenticated read/write/execute
+# primitive over USB, which is exactly what a debugger is.
+gdb_stub = ["dep:usbd-serial", "dep:pqf-gdbstub-core"]
+
+mldsa44 = ["pqf-signer-core/mldsa44"]
+mldsa65 = ["pqf-signer-core/mldsa65"]
+mldsa87 = ["pqf-signer-core/mldsa87"]
+
+# Mixed-architecture mode: Arm core 0 + RISC-V (Hazard3) core 1.
+#
+# Only meaningful on the Arm target (riscv builds reject it with a
+# compile_error). When enabled, build.rs cross-compiles the
+# `pqf-core1-riscv` payload (crates/fw-core1-riscv) for riscv32imac,
+# embeds the flat binary at 0x1028_0000 via the `.core1_blob` section
+# (see memory_core1riscv.x -- firmware RAM shrinks to 384 KiB to grant
+# core 1 its own 128 KiB window), and at boot `core1_launch` flips
+# core 1's OTP ARCHSEL bit, PSM-resets it, and launches the payload --
+# the ML-DSA signing worker then runs on a Hazard3 while the Arm core
+# keeps doing USB/CTAP. The two link units share the mailbox layout
+# through pqf-signer-core.
+#
+# Silicon-validated: the launch sequence follows the RP2350 datasheet
+# (sec. 3.9 ARCHSEL, sec. 5.3 core-1 launch) and has been exercised on a real
+# Feitian RP2350 at all three ML-DSA levels, both ports.
+#
+# TRAP: leaving a MIXED image on a board leaves ARCHSEL set for core 1,
+# and the bootrom never put it there so nothing undoes it -- neither
+# `picotool erase -a` nor a power cycle. The next pure-Arm image then
+# hangs before USB with no HID, no BOOTSEL and no tty, which reads as a
+# defect in whatever you just flashed. Run `picotool reboot -a -c arm`
+# BEFORE loading an Arm image after a mixed one. See docs/TESTING.md,
+# "Leaving a mixed image bricks the next Arm one".
+#
+# Build incantation:
+#   cargo build --release --features core1_riscv
+core1_riscv = []
+
+# Drop the user-presence gate for the CTAPHID_CMD_REBOOT vendor command
+# ONLY, so a flash station can reboot into BOOTSEL / warm-reboot with no
+# touch. Unlike a buttonless board profile this does NOT weaken FIDO
+# user presence (MakeCredential / GetAssertion still require the
+# gesture) -- it only trusts a host that can already talk to the token to
+# reboot it. C-port equivalent: -DPQF_REBOOT_NO_UP=ON.
+#
+# This is one input to the per-board policy in src/reboot_policy.rs.
+# The gate exists only on the boards with both a readable button and a
+# power-on BOOTSEL (board_tiny2350, board_feitian_rp2350); everywhere
+# else -- the buttonless boards, and board_feitian_rp2350_usbc, which
+# has no power-on BOOTSEL -- it is already off and this feature changes
+# nothing. `picotool info -a` on the built image shows the outcome as
+# `pqf-reboot=touch` / `pqf-reboot=no-touch`.
+#   cargo build --release --features reboot_no_up
+reboot_no_up = []
+
+# The USB DFU *runtime* interface: a control-only interface that lets
+# `dfu-util -D` detach a RUNNING token into the DFU bootloader, which is
+# the other half of the C port's PQF_BOOTLOADER option. The link half is
+# separate and already exists -- PQF_APP_OFFSET=1 (an env var, see
+# build.rs) relocates the image into the bootloader's app slot. Both are
+# needed for a DFU-updatable Rust image; this feature alone only adds an
+# interface the bootloader would have to be reached some other way for.
+#
+#   PQF_APP_OFFSET=1 cargo build --release -F dfu_runtime ...
+dfu_runtime = []
+
+# TEST-ONLY: force user-presence auto-confirm even on a board with a real
+# button, so automated on-silicon CTAP tests run without a physical press.
+# The C port's equivalent is -DPQF_TEST_NO_USER_BUTTON=ON. NEVER SHIP: this
+# removes the user-presence gate from MakeCredential and GetAssertion, which
+# is the whole point of a security key. Unlike `reboot_no_up` (which ungates
+# only CTAPHID_CMD_REBOOT and leaves FIDO UP intact), this ungates FIDO UP
+# itself.
+test_no_user_button = []
+
+# Single core: leave core 1 asleep and run the hybrid signer inline on
+# core 0. The second core exists only to keep CTAPHID KEEPALIVE frames
+# flowing during a ~1 s signature; here a hardware timer does that
+# instead -- alarm 0 of TIMER0 fires every 25 ms and its interrupt
+# handler sends a KEEPALIVE on the in-flight channel and services USB
+# (`src/keepalive_timer.rs`). bc-rust is untouched: the sign is the same
+# monolithic call, interrupted rather than yielding. Frees the 64 KiB
+# core-1 stack and drops the flash-op park handshake. Either
+# instruction set. Exclusive with `core1_riscv` (the mixed build IS a
+# second core) and with `gdb_stub` (which also drives USB from an
+# exception context). The USB product string gains " 1CORE" so a host
+# can tell which signer an image runs. C port: -DPQF_SINGLE_CORE=ON.
+#
+#   cargo build --release --features single_core
+single_core = []
+
+# Board selection. Mutually exclusive -- pick the one your physical
+# RP2350 dev board matches. Each gates the LED + quirk-pin assignments
+# in `src/board/<name>.rs`. To add a new board, see the "Adding a new
+# board" recipe in `src/board/mod.rs`.
+#
+#   board_tiny2350                  -- Pimoroni Tiny 2350. RGB LED on
+#                                      GP18 (R) / GP19 (G) / GP20 (B),
+#                                      all active-low.
+#   board_xiao_rp2350               -- Seeed Studio XIAO RP2350. Single
+#                                      user LED on GP25, active-low.
+#                                      Three logical channels OR-merge
+#                                      onto the one physical pin. GP23
+#                                      drives NeoPixel power -- held LOW.
+#   board_feitian_rp2350            -- Feitian RP2350 (Pi Pico 2
+#                                      reference design). Single user
+#                                      LED on GP25, active-HIGH (note:
+#                                      opposite polarity to the XIAO),
+#                                      channels OR-merged. 4 MiB flash
+#                                      assumed per the reference design.
+#   board_feitian_rp2350_usbc       -- Feitian RP2350 USB-C token: the
+#                                      dev board's hardware profile (it
+#                                      re-exports that module's `Board`)
+#                                      in a sealed case with a capacitive
+#                                      pad. Its power-on BOOTSEL does not
+#                                      work, so CMD_REBOOT never waits
+#                                      for a touch on it (see
+#                                      src/reboot_policy.rs); FIDO
+#                                      presence still does. Flash it
+#                                      only per docs/FLASHING.md (USB-C token).
+#   board_waveshare_rp2350_lcd_1_47 -- Waveshare RP2350-LCD-1.47-B /
+#                                      -B-M (Pico 2 footprint + LCD +
+#                                      SD slot + WS2812 RGB chain on
+#                                      GP23). Current driver is a
+#                                      no-op (LEDs dark); the LCD and
+#                                      SD card aren't touched by the
+#                                      firmware. Real WS2812 colour
+#                                      output is a future PIO task.
+#
+# Build incantations:
+#   cargo build --release                                                      # tiny2350 (default)
+#   cargo build --release --no-default-features -F mldsa65,board_xiao_rp2350
+#   cargo build --release --no-default-features -F mldsa65,board_feitian_rp2350_usbc
+#   cargo build --release --no-default-features -F mldsa65,board_waveshare_rp2350_lcd_1_47
+board_tiny2350 = []
+board_xiao_rp2350 = []
+board_feitian_rp2350 = []
+board_feitian_rp2350_usbc = []
+# The Waveshare and Spotpear LCD board features pull in the LCD-
+# driver crates so the on-board panel can show device stats. Both
+# share the same `mipidsi` + `embedded-graphics` + `embedded-hal-bus`
+# dep set (mipidsi supports both ST7789 and GC9A01 controllers from
+# the same crate). Other boards don't include them -- adds ~100 KiB
+# to the release binary, only paid when the feature is on.
+board_waveshare_rp2350_lcd_1_47 = [
+    "dep:mipidsi",
+    "dep:embedded-graphics",
+    "dep:embedded-hal-bus",
+]
+# Spotpear RP2350-LCD-1.28 -- round 1.28" 240x240 GC9A01 panel on
+# the same RP2350A SoC. Uses SPI1 (not SPI0 like the 1.47 Waveshare).
+# See `src/board/spotpear_rp2350_lcd_1_28/` for the GPIO pinout
+# and circular-display-friendly stats layout.
+board_spotpear_rp2350_lcd_1_28 = [
+    "dep:mipidsi",
+    "dep:embedded-graphics",
+    "dep:embedded-hal-bus",
+]
+
+# Optional EdDSA / Ed25519 (COSE alg -8) support. Off by default.
+#
+# When enabled, the device advertises alg -8 in `getInfo.algorithms`
+# alongside the build's hybrid PQC variant and ES256, and is willing
+# to make / verify credentials whose COSE alg is -8. The plaintext
+# of the credentialID encodes which algorithm to use via a separate
+# version byte (`0x02` for Ed25519, `0x01` for ES256 / hybrid) -- so
+# enabling this feature DOES NOT change the 145-byte on-wire length
+# of credentialIDs already issued by an ES256 / hybrid build (those
+# stay `version=0x01` and decrypt unchanged). New Ed25519 creds get
+# `version=0x02`. Bidirectional compatibility: an `ed25519`-enabled
+# build also decrypts v1 credentials, but a non-ed25519 build will
+# reject v2 credentials with `CTAP2_ERR_NO_CREDENTIALS`.
+#
+# Why off by default: the curve25519-dalek backend used by
+# `ed25519-dalek` adds ~30 KiB to the release binary and pulls a
+# nightly Rust feature gate for the field-arithmetic backend. Users
+# who don't need EdDSA shouldn't pay that cost.
+#
+# Build incantation:
+#   cargo build --release --features ed25519
+ed25519 = ["dep:ed25519-dalek"]
+
+# Legacy CTAP1 / U2F (CTAPHID_MSG / 0x83) transport. OFF by default,
+# and deliberately so: the firmware advertises CAPABILITY_NMSG ("does
+# NOT support CTAPHID_MSG") and the CMD_MSG dispatch arm already
+# refuses U2F with ERR_INVALID_CMD (see `complete` in ctaphid.rs), so
+# the `u2f` module is dead code in a default build. Crucially it also
+# carries a HARDCODED development-only batch attestation private key
+# (`BATCH_KEY` in src/u2f.rs); gating the module behind this feature
+# keeps that key -- and the whole legacy surface -- out of production
+# binaries. Only enable it for U2F interop testing on a dev device,
+# never for a shipped build.
+#
+# Build incantation:
+#   cargo build --release --features u2f
+u2f = []
+
+[dependencies]
+# RP2350 HAL + register access. The boot ROM block macro lives here.
+rp235x-hal = { version = "0.4", features = [
+    "binary-info",          # picotool info works on our binary
+    "critical-section-impl",
+    "rt",                   # cortex-m-rt entry point
+] }
+
+# Panic handler that just blinks the on-board RGB LED. We'll replace with
+# our own once we have USB CDC up so panics can stream to /dev/cu.usbmodem*.
+panic-halt = "1.0"
+
+# Embedded-hal for GPIO traits.
+embedded-hal = "1.0"
+
+# USB device stack (works on rp235x-hal's UsbBus). We implement the
+# FIDO HID class directly in `src/fido_hid.rs` rather than via
+# usbd-hid -- the FIDO usage page (0xF1D0) report descriptor and the
+# 64-byte interrupt IN/OUT endpoints are non-standard enough that the
+# macro-driven HID class generator adds friction for no win.
+# CDC ACM for the GDB stub's transport. Optional: the shipping firmware
+# exposes FIDO HID alone.
+usbd-serial = { version = "0.2", default-features = false, optional = true }
+# The GDB stub's protocol engine, shared with the host harness so the
+# code that ships is the code a real gdb was pointed at.
+pqf-gdbstub-core = { path = "../gdbstub-core", optional = true }
+usb-device = "0.3"
+
+# CBOR codec for CTAP2 framing. Workspace sibling at `../cbor/`,
+# implementing the subset of RFC 8949 that CTAP 2.1 uses. No
+# external path-deps. See `../cbor/src/lib.rs` for the encoder /
+# decoder + the `cbor_int!` / `cbor_map!` / `cbor_array!`
+# construction macros the firmware uses.
+pqf-cbor = { path = "../cbor" }
+
+# RustCrypto ECDSA-P256 / ECDH-P256, for ES256 attestation + assertion
+# signatures and the CTAP2 PIN-protocol key agreement. `no_std`.
+#
+# This is the one thing bc-rust cannot supply: its roadmap declines
+# ECDSA and ECDH outright, and ES256 (COSE alg -7) is mandatory for
+# FIDO2. SHA-256 / HMAC / HKDF / ct-compare used to come from the
+# RustCrypto crates alongside it and now come from bc-rust -- see
+# `src/bc_crypto.rs`. `sha2`, `hmac` and `subtle` are consequently no
+# longer direct dependencies; p256 still pulls them in transitively for
+# its own RFC 6979 and field arithmetic, so they remain in the binary.
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdsa",
+    "ecdh",
+    "sha256",
+] }
+rand_core = { version = "0.6", default-features = false }
+heapless = "0.8"
+zeroize = { version = "1.7", default-features = false }
+
+# AES-256-CBC for CTAP PIN protocol v1 shared-secret encryption.
+# (bc-rust has no AES yet; it's on their roadmap, issues #64/#65.)
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["alloc"] }
+
+# Global allocator backed by a fixed-size statically-reserved heap.
+# pqf-cbor and several RustCrypto operations (signing, key derivation
+# scratch) want `alloc`. 32 KiB of heap is comfortable for CTAP2.
+embedded-alloc = "0.6"
+
+# ML-DSA -- Bouncy Castle Rust port, low-memory variant. ~1/10 the
+# RAM footprint of the stock crate at the cost of ~3x signing time
+# (~5-7 s for ML-DSA-65 on Cortex-M33 @ 125 MHz). We offset the
+# slowdown by running signing on the second core (see core1_signer)
+# while the main core keeps emitting CTAP HID KEEPALIVE frames so
+# Chrome's WebAuthn watchdog doesn't fire. The crate's code is used
+# UNMODIFIED -- all the streaming hooks we need (`MuBuilder`,
+# `sign_mu_deterministic_out`, `keygen_from_seed`) are already in its
+# public surface.
+#
+# The crates are vendored under `crates/bc-rust-mini/` -- a subset
+# snapshot of bc-rust's no_std branch (on upstream release/0.1.3alpha),
+# comments transliterated to ASCII and nothing else touched; see its
+# README.md for provenance and the refresh procedure -- so no sibling
+# checkout is needed.
+#
+# `default-features = false` is what keeps this a bare-metal build: the
+# ML-DSA crate's default `std` feature forwards to `bouncycastle-rng/std`,
+# which pulls `getrandom` and has no backend on this target. With it off,
+# the OS-seeded conveniences are gone and we supply seeds / signing
+# nonces ourselves -- which is what `keygen_from_seed` and the
+# `sign_*_deterministic_out` entry points are for. The other vendored
+# crates have no features; the flag is kept on them so every bc-rust
+# line reads the same.
+#
+# `bouncycastle-core` was named `bouncycastle-core-interface` before the
+# upstream rename; the local alias is kept so the `use` paths in this
+# crate don't all have to change.
+bouncycastle-mldsa-lowmemory = { path = "../bc-rust-mini/crypto/mldsa-lowmemory", default-features = false }
+bouncycastle-core-interface = { package = "bouncycastle-core", path = "../bc-rust-mini/crypto/core", default-features = false }
+
+# SHA-256 / HMAC-SHA-256 / HKDF-SHA-256 / constant-time compare for the
+# CTAP2 symmetric surface (PIN protocols, credentialID wrapping,
+# hmac-secret, largeBlobs checksums). See `src/bc_crypto.rs` -- that
+# module is the only thing in the firmware that touches these crates,
+# and it keeps every output buffer off the heap via the `*_out` APIs.
+# The HMAC and HKDF instantiations come from the sha2 crate (bc-rust
+# 0.1.3 moved them there); `bouncycastle-hmac` and `-hkdf` are the
+# generic crates behind them, vendored and reached transitively.
+#
+# Note this does NOT drop RustCrypto `sha2`: `p256` pulls it in
+# transitively for RFC 6979, and ECDSA-P256 has no bc-rust counterpart.
+bouncycastle-sha2 = { path = "../bc-rust-mini/crypto/sha2", default-features = false }
+bouncycastle-utils = { path = "../bc-rust-mini/crypto/utils", default-features = false }
+
+# The core-1 signing worker + cross-core mailbox + arch asm shims,
+# shared with the mixed-architecture RISC-V core-1 payload (see the
+# `core1_riscv` feature above). The firmware's `arch`, `core1_signer`
+# and `mldsa_alg` modules are thin re-exports of this crate.
+pqf-signer-core = { path = "../signer-core" }
+
+# LCD driver stack -- only linked when the Waveshare board feature is
+# enabled. `mipidsi` 0.9 supports the ST7789V2 controller on the
+# Waveshare RP2350-LCD-1.47 panel and ships its own SpiInterface
+# (newer crates dropped the external `display-interface-spi`
+# dependency). `embedded-graphics` provides text + primitive
+# drawing on top of the framebuffer. `embedded-hal-bus` lets us
+# wrap our SPI bus + CS pin as an `ExclusiveDevice` to satisfy
+# `mipidsi`'s `SpiDevice` bound.
+mipidsi = { version = "0.9", optional = true }
+embedded-graphics = { version = "0.8", optional = true }
+embedded-hal-bus = { version = "0.2", optional = true }
+
+# Ed25519 -- pure-Rust EdDSA over Curve25519. `default-features = false`
+# drops `std` and `serde`. `zeroize` wipes private-scalar memory on
+# drop (matches the rest of our keys' cleanup posture). `rand_core`
+# lets `SigningKey::generate(&mut rng)` accept our `Trng`. Gated
+# entirely behind the `ed25519` cargo feature so non-EdDSA builds
+# don't link it.
+ed25519-dalek = { version = "2", default-features = false, optional = true, features = ["zeroize", "rand_core", "alloc"] }
+
+# ---------------------------------------------------------------------
+# Per-architecture runtime crates. The RP2350 boots either its two
+# Cortex-M33 cores (Arm) or its two Hazard3 cores (RISC-V) depending on
+# the IMAGE_DEF in the flashed image; this firmware builds for both
+# (see `.cargo/config.toml` for the target triples and linker setup,
+# and `src/arch.rs` for the small asm shim covering the differences).
+# All arch-specific asm in this crate goes through `src/arch.rs`; the
+# runtime crates below only provide startup/linker glue (and, via
+# rp235x-hal's own target-specific deps, the entry macro internals).
+
+# Arm: Cortex-M runtime + linker glue.
+[target.'thumbv8m.main-none-eabihf'.dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.5"
+
+# RISC-V: riscv-rt provides startup + trap handling; the `riscv` crate
+# is what rp235x-hal itself uses for CSR access on this target. Pinned
+# to the same versions rp235x-hal 0.4 declares so features unify.
+[target.'riscv32imac-unknown-none-elf'.dependencies]
+riscv = "0.11"
+riscv-rt = "0.12"

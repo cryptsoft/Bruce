@@ -1,0 +1,29 @@
+# pqf-cbor -- CBOR codec for the Bruce firmware.
+#
+# Implements the subset of RFC 8949 the CTAP 2.1 protocol uses:
+# unsigned + negative integers, byte + text strings, arrays, maps,
+# tags, and the simple values true / false / null / undefined.
+# Definite-length encoding only, shortest-form integers on the
+# writer side. No floats, no indefinite-length items, no streaming
+# reader.
+#
+# ~700 LOC of code + tests in a single src/lib.rs. Zero external
+# dependencies; `no_std` + `alloc`.
+
+[package]
+name = "pqf-cbor"
+version = "0.1.0"
+edition = "2021"
+description = "CBOR codec covering the subset CTAP 2.1 uses. RFC 8949 sec. 3 + sec. 4.2.1 canonical encoding. no_std + alloc, no external deps."
+# Licensed under the Apache License, Version 2.0. See LICENSE and
+# THIRD_PARTY.md at the repository root.
+license = "Apache-2.0"
+
+[lib]
+name = "pqf_cbor"
+path = "src/lib.rs"
+
+[dependencies]
+# Intentionally empty. The whole point of this crate is to not pull
+# any dependencies into the firmware beyond what alloc and core
+# already give us.

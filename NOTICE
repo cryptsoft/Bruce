@@ -1,0 +1,25 @@
+Bruce
+Copyright 2025-2026 Cryptsoft Pty Ltd
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the
+LICENSE file at the root of this repository.
+
+This product includes third-party software, each component under its
+own permissive licence with its upstream notice kept in place:
+
+  - Google OpenSK (Apache-2.0): the attributed protocol-surface ports
+    and the PQF_HYBRID_LABEL constant. Licence text: LICENSE-APACHE-OPENSK.
+  - OpenSSL 3.5 (Apache-2.0): the vendored subset under
+    c/firmware/openssl-mini/. Licence text:
+    c/firmware/openssl-mini/LICENSE-APACHE-OPENSSL.
+  - Bouncy Castle Rust crates (MIT, the Bouncy Castle Licence): the
+    vendored subset under crates/bc-rust-mini/. Licence text:
+    crates/bc-rust-mini/LICENSE.md.
+  - Raspberry Pi pico-examples and pico-sdk (BSD-3-Clause): the four
+    BOOTSEL sampler files (copyright notice inline, licence text in
+    LICENSE-BSD-3-CLAUSE-PICO-EXAMPLES) and the two pico_sdk_import.cmake
+    copies (licence text inline).
+  - OASIS PKCS#11 v3.01 headers (OASIS IPR Policy): c/pkcs11/oasis/,
+    notice retained in each file.
+
+THIRD_PARTY.md lists every component, its licence and its provenance.

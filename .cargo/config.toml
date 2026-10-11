@@ -1,0 +1,45 @@
+# RP2350 bringup -- both instruction sets.
+#
+# The RP2350 has two Cortex-M33 (Arm) and two Hazard3 (RISC-V) cores;
+# the boot ROM runs whichever architecture the flashed image declares
+# in its IMAGE_DEF. This firmware builds for either:
+#
+#   cargo build --release                                        # Arm (default)
+#   cargo build --release --target riscv32imac-unknown-none-elf  # RISC-V
+#
+# or via the aliases below (`cargo build-arm` / `cargo build-riscv`).
+
+[alias]
+build-arm = "build --target=thumbv8m.main-none-eabihf"
+build-riscv = "build --target=riscv32imac-unknown-none-elf"
+
+[build]
+# Default target: the Cortex-M33 secure bringup, hard-float ABI.
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    # --nmagic disables page alignment of sections.
+    "-C", "link-arg=--nmagic",
+    # cortex-m-rt's link.x consumes our memory.x.
+    "-C", "link-arg=-Tlink.x",
+    # Tune codegen for the actual core so FPU / DSP intrinsics are used.
+    "-C", "target-cpu=cortex-m33",
+]
+
+# Hazard3 RISC-V. Soft-float (no FPU on Hazard3); the `imac` baseline
+# is what the boot ROM guarantees. `rp235x_riscv.x` is our self-
+# contained linker script (crates/firmware/rp235x_riscv.x -- the RISC-V
+# equivalent of link.x + memory.x, copied to OUT_DIR by build.rs).
+[target.riscv32imac-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Trp235x_riscv.x",
+    # Hazard3 also implements the Zba/Zbb/Zbs bit-manipulation and
+    # Zbkb crypto-bitmanip extensions -- rotations and and-not matter
+    # for Keccak (ML-DSA's SHAKE) throughput.
+    "-C", "target-feature=+zba,+zbb,+zbs,+zbkb",
+]
+
+[env]
+DEFMT_LOG = "info"

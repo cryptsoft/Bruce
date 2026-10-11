@@ -1,0 +1,118 @@
+# cargo-deny configuration for Bruce.
+#
+# Run:  cargo deny check            # licenses, advisories, bans, sources
+#       cargo deny check licenses   # the licence audit alone
+#
+# This file backs the license audit in THIRD_PARTY.md. It enforces a
+# conservative allow-list of the permissive licenses that the project's
+# Rust dependency tree actually resolves to (Apache-2.0 / MIT /
+# BSD-3-Clause and the standard dual-licensed combinations).
+#
+# Bruce itself is Apache-2.0 (see LICENSE + THIRD_PARTY.md "License
+# summary"). The permissive-only allow-list below keeps a redistributed
+# firmware image free of reciprocal obligations: every third-party
+# component must remain permissive, and a copyleft dependency fails
+# this check. The first-party workspace crates carry the project's own
+# Apache-2.0, which the allow-list already covers.
+#
+# The C port's vendored sources (openssl-mini = OpenSSL 3.5 Apache-2.0,
+# the OpenSK PQF_HYBRID_LABEL constant = Apache-2.0, TinyUSB = MIT,
+# pico-sdk = BSD-3-Clause) are not Cargo crates and so are out of scope
+# for this tool; their provenance is documented in THIRD_PARTY.md and in
+# c/firmware/openssl-mini/README.md.
+
+[licenses]
+# Permissive licenses present in the resolved dependency tree. Adding a
+# crate that introduces any other license fails the check, which is the
+# point: it surfaces a copyleft (or otherwise unvetted) dependency
+# before it can be pulled into a firmware image.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",          # riscv / riscv-rt via rp235x-hal -- MIT-equivalent permissive
+    "Unicode-3.0",  # ICU-derived data tables pulled transitively by some crates
+]
+# Apache-2.0 with the LLVM exception shows up via some RustCrypto deps.
+# The first-party workspace crates need no exception any more: they are
+# Apache-2.0, which the allow-list above already covers. Third-party
+# copyleft still has to fail the check.
+exceptions = [
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "wasi" },
+]
+confidence-threshold = 0.9
+
+# The vendored bc-rust crates (crates/bc-rust-mini/crypto/*) carry no
+# `license` field in their Cargo.tomls, so cargo-deny reports them as
+# unlicensed. They ARE licensed: crates/bc-rust-mini/LICENSE.md is the
+# Bouncy Castle Licence, a verbatim MIT text with the Legion of the
+# Bouncy Castle copyright line. Clarify each crate to MIT, pointing at
+# that file (../../LICENSE.md relative to each crate directory).
+# (cargo-deny does not verify the file hash for path dependencies --
+# the audit trail for the MIT claim is THIRD_PARTY.md's Bouncy Castle
+# entry.)
+[[licenses.clarify]]
+crate = "bouncycastle-core"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-mldsa-lowmemory"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-rng"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-sha2"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-sha3"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-utils"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-hmac"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "bouncycastle-hkdf"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE.md", hash = 0 }]
+
+[bans]
+# No multiple-version policy enforced here yet; this stanza exists so the
+# file is a complete cargo-deny config and `cargo deny check` runs clean.
+multiple-versions = "allow"
+
+[advisories]
+# `cargo deny check advisories` runs in CI against the RustSec database.
+yanked = "warn"
+# Known and accepted: "unmaintained" notices on crates that reach the
+# firmware through the RP2350 HAL and cannot be replaced from this tree.
+#   RUSTSEC-2026-0110 -- bare-metal is deprecated: a dependency of
+#   cortex-m 0.7, which rp235x-hal and the firmware use for critical
+#   sections and interrupt control.
+#   RUSTSEC-2024-0436 -- paste is unmaintained: a build-time dependency of
+#   pio-core, the PIO assembler behind rp235x-hal; no code from it is in
+#   an image.
+#   RUSTSEC-2026-0173 -- proc-macro-error2 is unmaintained: a build-time
+#   dependency of pio-proc, likewise.
+# Revisit when rp235x-hal moves off them.
+ignore = ["RUSTSEC-2026-0110", "RUSTSEC-2024-0436", "RUSTSEC-2026-0173"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"   # bc-rust is vendored (crates/bc-rust-mini): path dependencies, not git
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

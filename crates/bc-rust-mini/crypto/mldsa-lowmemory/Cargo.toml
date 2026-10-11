@@ -1,0 +1,34 @@
+[package]
+name = "bouncycastle-mldsa-lowmemory"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# `std` forwards to `bouncycastle-rng/std`, which supplies the OS entropy
+# backend behind the hedged-signing nonce and the OS-seeded `keygen()`.
+# Disable it for bare-metal targets: the crate stays `no_std` and callers
+# supply `rnd` themselves (`sign_*_deterministic_out`) or seed a DRBG from a
+# platform TRNG. See the `std` notes in `lib.rs`.
+default = ["std"]
+std = ["bouncycastle-rng/std"]
+
+[dependencies]
+bouncycastle-core.workspace = true
+bouncycastle-sha2.workspace = true
+bouncycastle-sha3.workspace = true
+# Declared directly rather than inheriting from the workspace: a workspace
+# dependency that doesn't itself set `default-features` can't have them
+# turned off by a member, and the `std` feature above has to be able to.
+bouncycastle-rng = { path = "../rng", default-features = false }
+bouncycastle-utils.workspace = true
+
+[dev-dependencies]
+bouncycastle-core-test-framework.workspace = true
+bouncycastle-hex.workspace = true
+bouncycastle-rng.workspace = true
+criterion.workspace = true
+serde_json = "1.0"
+
+[[bench]]
+name = "mldsa_benches"
+harness = false

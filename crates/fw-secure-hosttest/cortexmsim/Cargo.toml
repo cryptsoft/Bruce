@@ -1,0 +1,11 @@
+[package]
+name = "pqf-cortexm-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Host stand-in for the cortex-m intrinsics the Secure world uses"
+
+[lib]
+name = "cortex_m"
+path = "src/lib.rs"

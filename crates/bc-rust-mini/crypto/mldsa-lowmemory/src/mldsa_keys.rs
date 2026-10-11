@@ -1,0 +1,661 @@
+use crate::aux_functions::{
+    bit_pack_eta, bit_pack_t0, power_2_round, rej_bounded_poly, simple_bit_pack_t1,
+    simple_bit_unpack_t1,
+};
+use crate::low_memory_helpers::{expandA_elem, s_unpack};
+use crate::mldsa::{H, N, POLY_T0PACKED_LEN, POLY_T1PACKED_LEN};
+use crate::mldsa::{MLDSA44_FULL_SK_LEN, MLDSA44_PK_LEN, MLDSA44_SK_LEN};
+use crate::mldsa::{MLDSA65_FULL_SK_LEN, MLDSA65_PK_LEN, MLDSA65_SK_LEN};
+use crate::mldsa::{MLDSA87_FULL_SK_LEN, MLDSA87_PK_LEN, MLDSA87_SK_LEN};
+use crate::params::{MLDSA44Params, MLDSA65Params, MLDSA87Params, MLDSAParams};
+use bouncycastle_core::errors::SignatureError;
+use bouncycastle_core::key_material;
+use bouncycastle_core::key_material::{KeyMaterial, KeyMaterialTrait, KeyType};
+use bouncycastle_core::traits::{SecurityStrength, SignaturePrivateKey, SignaturePublicKey, XOF};
+use bouncycastle_utils::secret::{Secret, ZeroizablePrimitive};
+use core::fmt;
+use core::fmt::{Debug, Display, Formatter};
+use core::ops::DerefMut;
+// imports just for docs
+#[allow(unused_imports)]
+use crate::mldsa::MLDSATrait;
+use crate::polynomial::Polynomial;
+
+/* Pub Types */
+
+/// ML-DSA-44 Public Key
+pub type MLDSA44PublicKey = MLDSAPublicKey<MLDSA44Params, MLDSA44_PK_LEN>;
+/// ML-DSA-44 Private Key
+pub type MLDSA44PrivateKey =
+    MLDSASeedPrivateKey<MLDSA44Params, MLDSA44_PK_LEN, MLDSA44_SK_LEN, MLDSA44_FULL_SK_LEN>;
+/// ML-DSA-65 Public Key
+pub type MLDSA65PublicKey = MLDSAPublicKey<MLDSA65Params, MLDSA65_PK_LEN>;
+/// ML-DSA-65 Private Key
+pub type MLDSA65PrivateKey =
+    MLDSASeedPrivateKey<MLDSA65Params, MLDSA65_PK_LEN, MLDSA65_SK_LEN, MLDSA65_FULL_SK_LEN>;
+/// ML-DSA-87 Public Key
+pub type MLDSA87PublicKey = MLDSAPublicKey<MLDSA87Params, MLDSA87_PK_LEN>;
+/// ML-DSA-87 Private Key
+pub type MLDSA87PrivateKey =
+    MLDSASeedPrivateKey<MLDSA87Params, MLDSA87_PK_LEN, MLDSA87_SK_LEN, MLDSA87_FULL_SK_LEN>;
+
+/// An ML-DSA public key.
+pub struct MLDSAPublicKey<P: MLDSAParams, const PK_LEN: usize> {
+    pub(crate) rho: [u8; 32],
+    pub(crate) t1_packed: P::T1Packed,
+}
+
+// Written out rather than derived: `#[derive(Clone)]` would demand `P: Clone`, and `P` is a
+// marker for the parameter set that is never stored, only used to name the field types.
+impl<P: MLDSAParams, const PK_LEN: usize> Clone for MLDSAPublicKey<P, PK_LEN> {
+    fn clone(&self) -> Self {
+        Self {
+            rho: self.rho,
+            t1_packed: self.t1_packed,
+        }
+    }
+}
+
+/// General trait for all ML-DSA public keys types.
+pub trait MLDSAPublicKeyTrait<P: MLDSAParams, const PK_LEN: usize>:
+    SignaturePublicKey<PK_LEN>
+{
+    /// Algorithm 23 pkDecode(pk)
+    /// Reverses the procedure pkEncode.
+    /// Input: Public key pk in B32+32k(bitlen (q-1)-d).
+    /// Output: rho in B32, t1 in Rk with coefficients in [0, 2bitlen (q-1)-d - 1].
+    fn pk_decode(pk: &[u8; PK_LEN]) -> Self;
+
+    /// Compute the public key hash (tr) from the public key.
+    ///
+    /// This is exposed as a public API for a few reasons:
+    /// 1. `tr` is required for some external-prehashing schemes such as the so-called "external mu" signing mode.
+    /// 2. `tr` is the canonical fingerprint of an ML-DSA public key, so would be an appropriate value
+    ///     to use, for example, to build a public key lookup or deny-listing table.
+    fn compute_tr(&self) -> [u8; 64];
+}
+
+pub(crate) trait MLDSAPublicKeyInternalTrait<P: MLDSAParams, const PK_LEN: usize> {
+    /// Not exposing a constructor publicly because the user should get an instance either by
+    /// running a keygen, or by decoding an existing key.
+    fn new(rho: [u8; 32], t1_packed: P::T1Packed) -> Self;
+
+    /// Get a ref to rho
+    fn rho(&self) -> &[u8; 32];
+
+    /// Get a ref to t1
+    fn unpack_t1_row(&self, row: usize) -> Polynomial;
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize> MLDSAPublicKeyTrait<P, PK_LEN>
+    for MLDSAPublicKey<P, PK_LEN>
+{
+    fn pk_decode(pk: &[u8; PK_LEN]) -> Self {
+        let mut t1_packed = <P::T1Packed as ZeroizablePrimitive>::ZEROED;
+        t1_packed.as_mut().copy_from_slice(&pk[32..]);
+        Self {
+            rho: pk[..32].try_into().unwrap(),
+            t1_packed,
+        }
+    }
+
+    fn compute_tr(&self) -> [u8; 64] {
+        let mut tr = [0u8; 64];
+        H::new().hash_xof_out(&self.encode(), &mut tr);
+
+        tr
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize> MLDSAPublicKeyInternalTrait<P, PK_LEN>
+    for MLDSAPublicKey<P, PK_LEN>
+{
+    fn new(rho: [u8; 32], t1_packed: P::T1Packed) -> Self {
+        Self { rho, t1_packed }
+    }
+
+    fn rho(&self) -> &[u8; 32] {
+        &self.rho
+    }
+
+    fn unpack_t1_row(&self, row: usize) -> Polynomial {
+        simple_bit_unpack_t1(
+            self.t1_packed.as_ref()[row * POLY_T1PACKED_LEN..(row + 1) * POLY_T1PACKED_LEN]
+                .try_into()
+                .expect("a T1Packed row is exactly POLY_T1PACKED_LEN bytes"),
+        )
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize> SignaturePublicKey<PK_LEN> for MLDSAPublicKey<P, PK_LEN> {
+    /// Algorithm 22 pkEncode(rho, t1)
+    /// Encodes a public key for ML-DSA into a byte string.
+    /// Input:rho in B32, t1 in Rk with coefficients in [0, 2bitlen (q-1)-d - 1].
+    /// Output: Public key pk in B32+32k(bitlen (q-1)-d).
+    fn encode(&self) -> [u8; PK_LEN] {
+        let mut pk = [0u8; PK_LEN];
+        self.encode_out(&mut pk);
+
+        pk
+    }
+    /// Algorithm 22 pkEncode(rho, t1)
+    /// Encodes a public key for ML-DSA into a byte string.
+    /// Input:rho in B32, t1 in Rk with coefficients in [0, 2bitlen (q-1)-d - 1].
+    /// Output: Public key pk in B32+32k(bitlen (q-1)-d).
+    fn encode_out(&self, out: &mut [u8; PK_LEN]) -> usize {
+        debug_assert_eq!(out.len(), PK_LEN);
+
+        out.fill(0);
+
+        out[..32].copy_from_slice(&self.rho);
+        out[32..].copy_from_slice(self.t1_packed.as_ref());
+
+        PK_LEN
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureError> {
+        if bytes.len() != PK_LEN {
+            return Err(SignatureError::DecodingError(
+                "Provided key bytes are the incorrect length",
+            ));
+        }
+        let sized_bytes: [u8; PK_LEN] = bytes[..PK_LEN].try_into().unwrap();
+        Ok(Self::pk_decode(&sized_bytes))
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize> Eq for MLDSAPublicKey<P, PK_LEN> {}
+
+impl<P: MLDSAParams, const PK_LEN: usize> PartialEq for MLDSAPublicKey<P, PK_LEN> {
+    fn eq(&self, other: &Self) -> bool {
+        let self_encoded = self.encode();
+        let other_encoded = other.encode();
+        bouncycastle_utils::ct::ct_eq_bytes(self_encoded.as_ref(), other_encoded.as_ref())
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize> fmt::Debug for MLDSAPublicKey<P, PK_LEN> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MLDSAPublicKey {{ alg: {}, pub_key_hash (tr): {:x?} }}",
+            P::ALG_NAME,
+            self.compute_tr(),
+        )
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize> Display for MLDSAPublicKey<P, PK_LEN> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MLDSAPublicKey {{ alg: {}, pub_key_hash (tr): {:x?} }}",
+            P::ALG_NAME,
+            self.compute_tr(),
+        )
+    }
+}
+
+/// General trait for all ML-DSA private keys types.
+pub trait MLDSAPrivateKeyTrait<
+    P: MLDSAParams,
+    const PK_LEN: usize,
+    const SK_LEN: usize,
+    const FULL_SK_LEN: usize,
+>: SignaturePrivateKey<SK_LEN>
+{
+    /// New from KeyMaterial. Can throw a SignatureError if the KeyMaterial does not contain sufficient entropy.
+    fn from_keymaterial(seed: &KeyMaterial<32>) -> Result<Self, SignatureError>;
+
+    /// Get a ref to the seed, if there is one stored with this private key
+    fn seed(&self) -> Option<&KeyMaterial<32>>;
+
+    /// Get a copy of the key hash `tr`.
+    /// This is computationally intensive as it requires fully re-computing the public key (and then discarding it).
+    /// It is highly recommended that, if the user already has a copy of the public key, they should get `tr` from that,
+    /// or else compute `tr` once and store it.
+    fn tr(&self) -> [u8; 64];
+    /// Returns the full public key, and has the side-effect of setting the public key hash tr in this MLDSASeedSK object.
+    fn derive_pk(&self) -> MLDSAPublicKey<P, PK_LEN>;
+    /// This produces the full private key in the encoding specified in FIPS 204 Algorithm 24 skEncode()
+    /// so that it is compatible with other implementations.
+    ///
+    /// Note that since this encoding does not include the seed, this is a one-way operation;
+    /// after exporting in this encoding, it will be impossible to re-import it into a [`MLDSASeedPrivateKey`].
+    fn encode_full_sk(&self) -> [u8; FULL_SK_LEN];
+    /// This produces the full private key in the encoding specified in FIPS 204 Algorithm 24 skEncode()
+    /// so that it is compatible with other implementations.
+    ///
+    /// Note that since this encoding does not include the seed, this is a one-way operation;
+    /// after exporting in this encoding, it will be impossible to re-import it into a [`MLDSASeedPrivateKey`].
+    fn encode_full_sk_out(&self, out: &mut [u8; FULL_SK_LEN]) -> usize;
+    /// Algorithm 25 skDecode(sk)
+    /// Reverses the procedure skEncode.
+    /// Input: Private key sk in B32+32+64+32*((l+k)*bitlen (2eta)+dk).
+    /// Output: rho in B32, K in B32, tr in B64 ,
+    /// s1 in Rl , s2 in Rk , t0 in Rk with coefficients in [-2d-1 + 1, 2d-1].
+    ///
+    /// Note: this object contains only the simple decoding routine to unpack a semi-expanded key.
+    /// See [`MLDSATrait`] for key generation functions, including derive-from-seed and consistency-check functions.
+    fn sk_decode(sk: &[u8; SK_LEN]) -> Self;
+}
+
+/// Internal structure for holding a seed-based private key for ML-DSA.
+pub struct MLDSASeedPrivateKey<
+    P: MLDSAParams,
+    const PK_LEN: usize,
+    const SK_LEN: usize,
+    const FULL_SK_LEN: usize,
+> {
+    _phantom: core::marker::PhantomData<P>,
+    // note: KeyMaterial is inherently Secret
+    seed: KeyMaterial<32>,
+    // public seed rho does not need to be secret
+    rho: [u8; 32],
+    rho_prime: Secret<[u8; 64]>,
+    K: Secret<[u8; 32]>,
+}
+// Written out rather than derived: the derives would demand `P: Clone` / `P: Eq`, and `P` is a
+// marker for the parameter set that is never stored, only used to name the field types.
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize> Clone
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    fn clone(&self) -> Self {
+        Self {
+            _phantom: core::marker::PhantomData,
+            seed: self.seed.clone(),
+            rho: self.rho,
+            rho_prime: self.rho_prime.clone(),
+            K: self.K.clone(),
+        }
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize> PartialEq
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    fn eq(&self, other: &Self) -> bool {
+        // Compared through `KeyMaterial`/`Secret`'s own `PartialEq`, which is constant-time: do
+        // not deref to the inner arrays, as that would select the array's variable-time `==`.
+        let seed = self.seed == other.seed;
+        let rho = self.rho == other.rho;
+        let rho_prime = self.rho_prime == other.rho_prime;
+        let K = self.K == other.K;
+        seed & rho & rho_prime & K
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize> Eq
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize> Debug
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let alg = P::ALG_NAME;
+        write!(
+            f,
+            "MLDSASeedPrivateKey {{ alg: {}, pub_key_hash (tr): {:x?} }}",
+            alg,
+            self.tr(),
+        )
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize> Display
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let alg = P::ALG_NAME;
+        write!(
+            f,
+            "MLDSASeedPrivateKey {{ alg: {}, pub_key_hash (tr): {:x?} }}",
+            alg,
+            self.tr(),
+        )
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize>
+    MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    /// Create a new MLDSASeedPrivateKey from a 32-byte KeyMaterial.
+    /// Seed SecurityStrength must match algorithm security strength: 128-bit (ML-DSA-44), 192-bit (ML-DSA-65), or 256-bit (ML-DSA-87),
+    /// otherwise it throws a SignatureError::KeyGenError("SecurityStrength".
+    pub fn new(seed: &KeyMaterial<32>) -> Result<Self, SignatureError> {
+        if !(seed.key_type() == KeyType::Seed || seed.key_type() == KeyType::CryptographicRandom)
+            || seed.key_len() != 32
+        {
+            return Err(SignatureError::KeyGenError(
+                "Seed must be 32 bytes and KeyType::Seed or KeyType::BytesFullEntropy.",
+            ));
+        }
+
+        if seed.security_strength() < P::MAX_SECURITY_STRENGTH {
+            return Err(SignatureError::KeyGenError("SecurityStrength"));
+        }
+
+        let (rho, rho_prime, K) = Self::compute_rhos_and_K(&seed);
+
+        Ok(Self {
+            _phantom: core::marker::PhantomData,
+            seed: seed.clone(),
+            rho,
+            rho_prime,
+            K,
+        })
+    }
+
+    fn compute_rhos_and_K(
+        seed: &KeyMaterial<32>,
+    ) -> ([u8; 32], Secret<[u8; 64]>, Secret<[u8; 32]>) {
+        // derive sk.K
+        // Alg 6; 1: (rho, rho_prime, K) <- H(xi||IntegerToBytes(k, 1)||IntegerToBytes(l, 1), 128)
+        //   // expand seed
+        let mut rho = [0u8; 32];
+        let mut rho_prime: Secret<[u8; 64]> = Secret::new();
+        let mut K: Secret<[u8; 32]> = Secret::new();
+
+        let mut h = H::default();
+        h.absorb(seed.ref_to_bytes())
+            .expect("absorb before squeeze is infallible");
+        h.absorb(&(P::k as u8).to_le_bytes())
+            .expect("absorb before squeeze is infallible");
+        h.absorb(&(P::l as u8).to_le_bytes())
+            .expect("absorb before squeeze is infallible");
+        let bytes_written = h.squeeze_out(&mut rho);
+        debug_assert_eq!(bytes_written, 32);
+        let bytes_written = h.squeeze_out(rho_prime.deref_mut());
+        debug_assert_eq!(bytes_written, 64);
+        let bytes_written = h.squeeze_out(K.deref_mut());
+        debug_assert_eq!(bytes_written, 32);
+
+        (rho, rho_prime, K)
+    }
+
+    fn compute_t_row(
+        &self,
+        idx: usize,
+        s1_packed: &Secret<P::S1Packed>,
+        s2_packed: &Secret<P::S2Packed>,
+    ) -> Polynomial {
+        debug_assert!(idx < P::k);
+
+        // [Optimization Note]:
+        // This is one of the places that a row of s1 can be re-computed instead of expanded from the compressed form.
+        // let mut s1 = self.compute_s1_row(0);
+        let mut s1_hat_i = s_unpack::<P, _>(s1_packed, 0);
+        s1_hat_i.ntt();
+
+        let mut t_i = {
+            let mut t_hat_i = expandA_elem(&self.rho, idx, 0);
+            t_hat_i.multiply_ntt(&s1_hat_i);
+
+            for col in 1..P::l {
+                // [Optimization Note]:
+                // This is one of the places that a row of s1 can be re-computed instead of expanded from the compressed form.
+                // s1 = self.compute_s1_row(col);
+                let mut s1_hat = s_unpack::<P, _>(s1_packed, col);
+                s1_hat.ntt();
+                let mut A_elem = expandA_elem(&self.rho, idx, col);
+                A_elem.multiply_ntt(&s1_hat);
+                t_hat_i.add_ntt(&A_elem);
+            }
+            // Bound-keeping step before NTT-1, not in FIPS 204: see [`Polynomial::reduce32`].
+            t_hat_i.reduce32();
+            t_hat_i.inv_ntt();
+
+            t_hat_i
+        };
+
+        // [Optimization Note]:
+        // This is one of the places that a row of s2 can be re-computed instead of unpacked from the compressed form.
+        // let s2 = self.compute_s2_row(idx);
+        let s2 = s_unpack::<P, _>(s2_packed, idx);
+        t_i.add_ntt(&s2);
+        t_i.conditional_add_q();
+
+        t_i
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize>
+    SignaturePrivateKey<SK_LEN> for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    /// Encodes the private key seed.
+    fn encode(&self) -> [u8; SK_LEN] {
+        self.seed.ref_to_bytes().try_into().unwrap()
+    }
+
+    fn encode_out(&self, out: &mut [u8; SK_LEN]) -> usize {
+        out.fill(0);
+
+        out.copy_from_slice(self.seed.ref_to_bytes());
+
+        debug_assert_eq!(self.seed.ref_to_bytes().len(), SK_LEN);
+        SK_LEN
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureError> {
+        if bytes.len() != 32 {
+            return Err(SignatureError::DecodingError("Invalid seed length"));
+        }
+        let mut keymat = KeyMaterial::<32>::from_bytes(bytes)?;
+        key_material::do_hazardous_operations(&mut keymat, |keymat| {
+            keymat.set_key_type(KeyType::Seed)?;
+            keymat.set_security_strength(SecurityStrength::_256bit)
+        })?;
+
+        Self::new(&keymat)
+    }
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize>
+    MLDSAPrivateKeyTrait<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    fn from_keymaterial(seed: &KeyMaterial<32>) -> Result<Self, SignatureError> {
+        Self::new(seed)
+    }
+
+    fn seed(&self) -> Option<&KeyMaterial<32>> {
+        Some(&self.seed)
+    }
+
+    fn tr(&self) -> [u8; 64] {
+        let pk: MLDSAPublicKey<P, PK_LEN> = self.derive_pk();
+        pk.compute_tr()
+    }
+
+    fn derive_pk(&self) -> MLDSAPublicKey<P, PK_LEN> {
+        // The goal here is to get t1, which is built and compressed one row at a time.
+
+        let s1_packed: Secret<P::S1Packed> = self.compute_s1_packed();
+        let s2_packed: Secret<P::S2Packed> = self.compute_s2_packed();
+
+        let mut t1_packed = <P::T1Packed as ZeroizablePrimitive>::ZEROED;
+        debug_assert_eq!(P::T1_PACKED_LEN, POLY_T1PACKED_LEN * P::k);
+
+        for i in 0..P::k {
+            t1_packed.as_mut()[i * POLY_T1PACKED_LEN..(i + 1) * POLY_T1PACKED_LEN].copy_from_slice(
+                &simple_bit_pack_t1(&self.compute_t1_row(i, &s1_packed, &s2_packed)),
+            );
+        }
+
+        MLDSAPublicKey::<P, PK_LEN>::new(self.rho.clone(), t1_packed)
+    }
+    fn encode_full_sk(&self) -> [u8; FULL_SK_LEN] {
+        let mut out = [0; FULL_SK_LEN];
+        _ = self.encode_full_sk_out(&mut out);
+
+        out
+    }
+    fn encode_full_sk_out(&self, out: &mut [u8; FULL_SK_LEN]) -> usize {
+        out.fill(0);
+
+        // Algorithm 24 skEncode(rho, K, tr, s1, s2, t0)
+
+        let mut off: usize = 0;
+
+        // 1: sk <- rho||K||tr
+        out[0..32].copy_from_slice(&self.rho);
+        // K is protected inside a Secret<[u8]>, but here we really do need to deref and copy it out.
+        out[32..64].copy_from_slice(&*self.K);
+        out[64..128].copy_from_slice(&self.tr());
+        off += 128;
+
+        // 2: for i from 0 to l - 1 do
+        // 3:   sk <- sk || BitPack (s1[i], eta, eta)
+        // 4: end for
+        let s1_packed = self.compute_s1_packed();
+        out[off..off + P::S1_PACKED_LEN].copy_from_slice((*s1_packed).as_ref());
+        off += P::S1_PACKED_LEN;
+
+        // 5: for i from 0 to k - 1 do
+        // 6:   sk <- sk || BitPack (s2[i], eta, eta)
+        // 7: end for
+        let s2_packed = self.compute_s2_packed();
+        out[off..off + P::S2_PACKED_LEN].copy_from_slice((*s2_packed).as_ref());
+        off += P::S2_PACKED_LEN;
+
+        // 8: for i from 0 to k - 1 do
+        // 9:   sk <- sk || BitPack (t0[i], 2d-1 - 1, 2d-1)
+        // 10: end for
+        debug_assert_eq!(off + P::k * POLY_T0PACKED_LEN, FULL_SK_LEN);
+        for row in 0..P::k {
+            let t0_i = self.compute_t0_row(row, &s1_packed, &s2_packed);
+            out[off..off + POLY_T0PACKED_LEN].copy_from_slice(&bit_pack_t0(&t0_i));
+            off += POLY_T0PACKED_LEN;
+        }
+        debug_assert_eq!(off, FULL_SK_LEN);
+
+        FULL_SK_LEN
+    }
+
+    fn sk_decode(sk: &[u8; SK_LEN]) -> Self {
+        Self::from_bytes(sk).unwrap()
+    }
+}
+
+pub(crate) trait MLDSAPrivateKeyInternalTrait<
+    P: MLDSAParams,
+    const PK_LEN: usize,
+    const SK_LEN: usize,
+>: Sized
+{
+    fn rho(&self) -> &[u8; 32];
+    fn K(&self) -> &[u8; 32];
+
+    /// A single entry of a privacy key vector.
+    /// These tend to be used very transiently, so we won't bother wrapping it as a Secret.
+    fn compute_s1_row(&self, idx: usize) -> Polynomial;
+
+    /// Private key component.
+    /// The packed representation sticks around for the whole computation, so
+    /// we'll wrap in as a Secret.
+    fn compute_s1_packed(&self) -> Secret<P::S1Packed>;
+
+    /// A single entry of a privacy key vector.
+    /// These tend to be used very transiently, so we won't bother wrapping it as a Secret.
+    fn compute_s2_row(&self, idx: usize) -> Polynomial;
+
+    /// Private key component.
+    /// The packed representation sticks around for the whole computation, so
+    /// we'll wrap in as a Secret.
+    fn compute_s2_packed(&self) -> Secret<P::S2Packed>;
+
+    /// Public key component.
+    fn compute_t0_row(
+        &self,
+        idx: usize,
+        s1_packed: &Secret<P::S1Packed>,
+        s2_packed: &Secret<P::S2Packed>,
+    ) -> Polynomial;
+
+    /// Public key component.
+    fn compute_t1_row(
+        &self,
+        idx: usize,
+        s1_packed: &Secret<P::S1Packed>,
+        s2_packed: &Secret<P::S2Packed>,
+    ) -> Polynomial;
+}
+
+impl<P: MLDSAParams, const PK_LEN: usize, const SK_LEN: usize, const FULL_SK_LEN: usize>
+    MLDSAPrivateKeyInternalTrait<P, PK_LEN, SK_LEN>
+    for MLDSASeedPrivateKey<P, PK_LEN, SK_LEN, FULL_SK_LEN>
+{
+    fn rho(&self) -> &[u8; 32] {
+        &self.rho
+    }
+
+    fn K(&self) -> &[u8; 32] {
+        &self.K
+    }
+
+    fn compute_s1_row(&self, idx: usize) -> Polynomial {
+        debug_assert!(idx < P::l);
+        rej_bounded_poly::<P>(&self.rho_prime, &(idx as u16).to_le_bytes())
+    }
+
+    fn compute_s1_packed(&self) -> Secret<P::S1Packed> {
+        let mut s1_packed: Secret<P::S1Packed> = Secret::new();
+        let width = P::POLY_ETA_PACKED_LEN;
+        for idx in 0..P::l {
+            let s1_i = self.compute_s1_row(idx);
+            bit_pack_eta::<P>(
+                &s1_i,
+                &mut s1_packed.as_mut()[idx * width..(idx + 1) * width],
+            );
+        }
+        s1_packed
+    }
+
+    fn compute_s2_row(&self, idx: usize) -> Polynomial {
+        debug_assert!(idx < P::k);
+        rej_bounded_poly::<P>(&self.rho_prime, &((idx + P::l) as u16).to_le_bytes())
+    }
+
+    fn compute_s2_packed(&self) -> Secret<P::S2Packed> {
+        let mut s2_packed: Secret<P::S2Packed> = Secret::new();
+        let width = P::POLY_ETA_PACKED_LEN;
+        for idx in 0..P::k {
+            let s2_i = self.compute_s2_row(idx);
+            bit_pack_eta::<P>(
+                &s2_i,
+                &mut s2_packed.as_mut()[idx * width..(idx + 1) * width],
+            );
+        }
+        s2_packed
+    }
+
+    fn compute_t0_row(
+        &self,
+        idx: usize,
+        s1_packed: &Secret<P::S1Packed>,
+        s2_packed: &Secret<P::S2Packed>,
+    ) -> Polynomial {
+        let mut t0 = self.compute_t_row(idx, s1_packed, s2_packed);
+        for j in 0..N {
+            (_, t0[j]) = power_2_round(t0[j]);
+        }
+
+        t0
+    }
+
+    fn compute_t1_row(
+        &self,
+        idx: usize,
+        s1_packed: &Secret<P::S1Packed>,
+        s2_packed: &Secret<P::S2Packed>,
+    ) -> Polynomial {
+        let mut t1 = self.compute_t_row(idx, s1_packed, s2_packed);
+        for j in 0..N {
+            (t1[j], _) = power_2_round(t1[j]);
+        }
+
+        t1
+    }
+}

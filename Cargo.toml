@@ -1,0 +1,158 @@
+# Bruce -- Cargo workspace root.
+#
+# Virtual workspace; no [package] of its own. The three members are:
+#
+#   - `crates/firmware`       (`bruce`)    -- bare-metal RP2350A FIDO2
+#                                                authenticator firmware.
+#                                                Targets the embedded
+#                                                `thumbv8m.main-none-eabihf`
+#                                                triple via the workspace
+#                                                root `.cargo/config.toml`.
+#   - `crates/cbor`           (`pqf-cbor`)    -- CBOR codec used by both
+#                                                the firmware and the
+#                                                host-side client.
+#   - `crates/ctaphid-client` (`pqf-ctaphid`) -- host-side library for
+#                                                talking to CTAP 2.1
+#                                                authenticators over
+#                                                USB HID. Builds for
+#                                                the host, not the
+#                                                embedded target.
+#
+# C-language sibling libraries (`libpqcbor`, `libpqhid`) live under
+# `c/cbor/` and `c/hid/` with their own Makefiles. They are not Cargo
+# members. The Bouncy Castle Rust crates the firmware links are
+# vendored under `crates/bc-rust-mini/` (excluded below).
+#
+# Build incantations
+# ------------------
+#
+# From the workspace root, the default-members set covers the
+# embedded-target builds (firmware + the CBOR codec it depends on):
+#
+#   cargo build --release                              # default firmware
+#   cargo build --release -p bruce -F ...           # firmware variant
+#
+# Host-side crates need the host triple, which the embedded-default
+# `.cargo/config.toml` doesn't supply:
+#
+#   cargo test  -p pqf-cbor    --target $(rustc -vV | awk '/host/{print $2}')
+#   cargo build -p pqf-ctaphid --target $(rustc -vV | awk '/host/{print $2}')
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/firmware",
+    "crates/cbor",
+    "crates/ctaphid-client",
+    # Host-side PKCS#11 module exposing the token as an RNG (cdylib).
+    # Like ctaphid-client, host-only -- excluded from default-members.
+    "crates/pkcs11",
+    # Shared core-1 signing worker + mailbox -- compiled into the
+    # firmware for its own target AND cross-compiled to riscv32 for
+    # the mixed-architecture core-1 payload below.
+    "crates/signer-core",
+    # RSP protocol engine for the GDB stub -- built for the firmware's
+    # target AND for the host, where a real gdb can drive it with no
+    # board attached.
+    "crates/gdbstub-core",
+    # RISC-V core-1 payload for the mixed-architecture build (Arm
+    # core 0 + Hazard3 core 1). Riscv32-only; built automatically by
+    # the firmware's build.rs when the `core1_riscv` feature is on --
+    # never part of the default build set.
+    "crates/fw-core1-riscv",
+    # Host tests for the Secure world's storage logic. `fw-secure` itself
+    # cannot be a member (own linker script, own lockfile, CMSE flags) and
+    # cannot be compiled for the host at all, so its credential store and
+    # counter are pulled in by path here and run against a simulated die.
+    # Host-only, like ctaphid-client -- not in default-members.
+    # Host tests for the Rust firmware's hardware-free logic -- the
+    # counterpart to the C port's twelve host binaries. Host-only.
+    "crates/firmware-hosttest",
+    "crates/fw-secure-hosttest",
+    "crates/fw-secure-hosttest/halsim",
+    "crates/fw-secure-hosttest/cortexmsim",
+]
+# The TrustZone-M split images (docs/TRUSTZONE.md) are NOT workspace
+# members: each needs its own linker script and CMSE link flags (via
+# build.rs), and each carries its own Cargo.lock. They still inherit this
+# repo's root .cargo/config.toml by directory. Excluded so a
+# workspace-wide `cargo build` doesn't try to build them as members --
+# build them with ./build-tz.sh instead.
+exclude = [
+    "crates/fw-secure",
+    "crates/fw-nonsecure",
+    # The vendored Bouncy Castle Rust crates are a nested workspace of
+    # their own (their manifests inherit from a workspace root, as
+    # upstream's do), consumed by path from firmware, signer-core,
+    # fw-secure and firmware-hosttest. Excluded so their
+    # dev-dependencies and benches stay out of this lockfile. See
+    # crates/bc-rust-mini/README.md.
+    "crates/bc-rust-mini",
+]
+# `cargo build` (no -p, no --target override) from the workspace root
+# builds firmware + cbor -- both compile cleanly under the embedded
+# triple. The host-side `ctaphid-client` is excluded from the default
+# set because it pulls `hidapi` (a host-only C library) that doesn't
+# link for embedded.
+default-members = [
+    "crates/firmware",
+    "crates/cbor",
+]
+
+# Shared metadata for the Rust crates. Crate-level Cargo.toml files can
+# pull these via `<field>.workspace = true` if they choose; today each
+# crate still declares its own to keep the migration small.
+[workspace.package]
+edition = "2021"
+
+# Release profile: optimised for the firmware. The host crates pick up
+# the same profile when built standalone -- opt="s" is fine for them
+# because their hot paths (CBOR encode/decode, HID framing) are I/O
+# bound, not compute bound.
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+# Stay at opt-level "s" for the binary itself -- opt-level=3 here has
+# previously regressed USB enumeration on this chip (probably driver-
+# side inlining artifact). Crypto deps get a per-package O3 override
+# below, which is what actually matters for ML-DSA throughput.
+opt-level = "s"
+overflow-checks = false
+panic = "abort"
+
+# Crypto hot paths (Keccak, NTT, polynomial mul). Without O3 ML-DSA
+# keygen takes >60s on Cortex-M33 at 125 MHz; at O3 it's hundreds of
+# ms -- fast enough for FIDO. We only bump the math-heavy deps; the
+# binary itself stays opt="s" to avoid blowing past the 4 MB flash
+# budget with inlined Rust code.
+[profile.release.package."bouncycastle-mldsa-lowmemory"]
+opt-level = 3
+[profile.release.package."bouncycastle-sha3"]
+opt-level = 3
+[profile.release.package."bouncycastle-sha2"]
+opt-level = 3
+[profile.release.package."bouncycastle-core"]
+opt-level = 3
+[profile.release.package."bouncycastle-utils"]
+opt-level = 3
+# HMAC / HKDF are on the CTAP hot path too -- every assertion MACs a
+# credentialID, and each PIN handshake runs two HKDF derivations. The
+# compression function itself is in bouncycastle-sha2 above; these two
+# cover the ipad/opad and block-assembly code around it.
+[profile.release.package."bouncycastle-hmac"]
+opt-level = 3
+[profile.release.package."bouncycastle-hkdf"]
+opt-level = 3
+[profile.release.package.p256]
+opt-level = 3
+[profile.release.package."elliptic-curve"]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.dev]
+debug = 2
+opt-level = 1      # don't go to 0; the panic LED would compile to nothing useful
+overflow-checks = true
+panic = "abort"

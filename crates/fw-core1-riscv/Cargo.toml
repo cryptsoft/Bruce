@@ -1,0 +1,60 @@
+# pqf-core1-riscv -- standalone RISC-V (Hazard3) core-1 payload for the
+# mixed-architecture firmware build.
+#
+# When the firmware is built with `-F core1_riscv` (Arm core 0 +
+# RISC-V core 1), the firmware's build.rs cross-compiles THIS crate
+# for riscv32imac, objcopy's it to a flat binary, and embeds it in the
+# Arm image at the fixed flash window described in
+# `pqf_signer_core::mixed`. At boot, core 0 flips core 1's OTP ARCHSEL
+# bit, resets it through PSM, launches this payload via the boot-ROM
+# FIFO handshake, and pushes the mailbox address through the FIFO.
+#
+# The signing logic is NOT here -- it's the shared `pqf-signer-core`
+# worker, identical to what same-architecture builds run. This crate
+# is only the scaffolding a bare payload needs: entry/trap asm, .data/
+# .bss init, a private heap, and the FIFO rendezvous.
+#
+# Never build this crate directly for Arm or the host; it is a
+# workspace member (so it shares the lockfile and release profile) but
+# not a default member. The firmware build.rs invocation is:
+#
+#   cargo build --release --target riscv32imac-unknown-none-elf \
+#       --manifest-path crates/fw-core1-riscv/Cargo.toml \
+#       --no-default-features -F <mldsa level>  # + its own RUSTFLAGS
+#
+# Licensed under the Apache License, Version 2.0. See LICENSE at
+# the repository root.
+
+[package]
+name = "pqf-core1-riscv"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "pqf-core1-riscv"
+path = "src/main.rs"
+
+# ML-DSA level -- MUST match the firmware build embedding this blob
+# (the mailbox signature buffer is sized by it, and that layout is
+# cross-link-unit ABI). The firmware's build.rs forwards its own
+# selection; the default here only serves standalone `cargo build`
+# smoke tests of this crate.
+[features]
+default = ["mldsa65"]
+mldsa44 = ["pqf-signer-core/mldsa44"]
+mldsa65 = ["pqf-signer-core/mldsa65"]
+mldsa87 = ["pqf-signer-core/mldsa87"]
+
+[dependencies]
+# The actual worker + mailbox + arch shims.
+pqf-signer-core = { path = "../signer-core", default-features = false }
+
+# The ML-DSA lowmem crate allocates its working set on the heap, so
+# the payload carries its own small allocator over a static buffer in
+# blob RAM -- deliberately NOT shared with core 0's heap, so no
+# cross-architecture lock is ever needed.
+embedded-alloc = "0.6"
+# embedded-alloc synchronises through critical-section; we provide the
+# trivial single-core implementation (mstatus.MIE mask) in main.rs.
+critical-section = { version = "1.2", features = ["restore-state-u32"] }
